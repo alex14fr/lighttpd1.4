@@ -913,10 +913,18 @@ static void show_features (void) {
 #else
       "\t- PAM support\n"
 #endif
+#if !defined(HAVE_SYS_INOTIFY_H) && !defined(HAVE_KQUEUE)
 #ifdef HAVE_FAM_H
       "\t+ FAM support\n"
 #else
       "\t- FAM support\n"
+#endif
+#endif
+#ifdef HAVE_SYS_INOTIFY_H
+      "\t+ inotify support\n"
+#endif
+#ifdef HAVE_KQUEUE
+      "\t+ kqueue support\n"
 #endif
 #ifdef HAVE_LUA_H
       "\t+ LUA support\n"
@@ -1397,8 +1405,8 @@ static int server_main_setup (server * const srv, int argc, char **argv) {
 	int i_am_root = 0;
 #ifdef HAVE_FORK
 	int parent_pipe_fd = -1;
-#endif
 	const char *conffile = NULL;
+#endif
 
 #ifdef HAVE_GETUID
 	i_am_root = (0 == getuid());
@@ -1431,7 +1439,9 @@ static int server_main_setup (server * const srv, int argc, char **argv) {
 			if (config_read(srv, optarg)) {
 				return -1;
 			}
+#ifdef HAVE_FORK
 			conffile = optarg;
+#endif
 			break;
 		case 'm':
 			srv->srvconf.modules_dir = optarg;
