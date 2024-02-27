@@ -757,7 +757,7 @@ SETDEFAULTS_FUNC(mod_deflate_set_defaults) {
         for (; -1 != cpv->k_id; ++cpv) {
             switch (cpv->k_id) {
               case 9: /* compress.filetype */
-                log_error(srv->errh, __FILE__, __LINE__,
+                log_warn(srv->errh, __FILE__, __LINE__,
                   "DEPRECATED: %s replaced with deflate.mimetypes",
                   cpk[cpv->k_id].k);
                 cpv->k_id = 0; /* deflate.mimetypes */
@@ -778,7 +778,7 @@ SETDEFAULTS_FUNC(mod_deflate_set_defaults) {
                 if (0 == cpv->v.a->used) cpv->v.a = NULL;
                 break;
               case 10:/* compress.allowed-encodings */
-                log_error(srv->errh, __FILE__, __LINE__,
+                log_warn(srv->errh, __FILE__, __LINE__,
                   "DEPRECATED: %s replaced with deflate.allowed-encodings",
                   cpk[cpv->k_id].k);
                 cpv->k_id = 1; /* deflate.allowed-encodings */
@@ -788,7 +788,7 @@ SETDEFAULTS_FUNC(mod_deflate_set_defaults) {
                 cpv->vtype = T_CONFIG_LOCAL;
                 break;
               case 12:/* compress.max-filesize */
-                log_error(srv->errh, __FILE__, __LINE__,
+                log_warn(srv->errh, __FILE__, __LINE__,
                   "DEPRECATED: %s replaced with deflate.max-compress-size",
                   cpk[cpv->k_id].k);
                 cpv->k_id = 2; /* deflate.max-compress-size */
@@ -809,7 +809,7 @@ SETDEFAULTS_FUNC(mod_deflate_set_defaults) {
               case 6: /* deflate.work-block-size */
                 break;
               case 13:/* compress.max-loadavg */
-                log_error(srv->errh, __FILE__, __LINE__,
+                log_warn(srv->errh, __FILE__, __LINE__,
                   "DEPRECATED: %s replaced with deflate.max-loadavg",
                   cpk[cpv->k_id].k);
                 cpv->k_id = 7; /* deflate.max-loadavg */
@@ -820,7 +820,7 @@ SETDEFAULTS_FUNC(mod_deflate_set_defaults) {
                   : 0.0;
                 break;
               case 11:/* compress.cache-dir */
-                log_error(srv->errh, __FILE__, __LINE__,
+                log_warn(srv->errh, __FILE__, __LINE__,
                   "DEPRECATED: %s replaced with deflate.cache-dir",
                   cpk[cpv->k_id].k);
                 cpv->k_id = 8; /* deflate.cache-dir */
@@ -1687,7 +1687,7 @@ static off_t mod_deflate_file_chunk_no_mmap(request_st * const r, handler_ctx * 
 }
 
 
-#ifdef ENABLE_MMAP
+#if 0
 
 static off_t mod_deflate_file_chunk_setjmp_cb (void *dst, const void *src, off_t len)
 {
@@ -1732,7 +1732,7 @@ static off_t mod_deflate_file_chunk(request_st * const r, handler_ctx * const hc
             return -1;
         }
     }
-  #ifdef ENABLE_MMAP
+  #if 0
     return mod_deflate_file_chunk_mmap(r, hctx, c, n);
   #else
     return mod_deflate_file_chunk_no_mmap(r, hctx, c, n);
