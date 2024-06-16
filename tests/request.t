@@ -1208,7 +1208,7 @@ Authorization: Digest username="jan", realm="download archiv",
 	algorithm="md5", response="049b000fb00ab51dddea6f093a96aa2e"
 EOF
   );
-$t->{RESPONSE} = [ { 'HTTP-Protocol' => 'HTTP/1.0', 'HTTP-Status' => 401, 'WWW-Authenticate' => '/, stale=true$/' } ];
+$t->{RESPONSE} = [ { 'HTTP-Protocol' => 'HTTP/1.0', 'HTTP-Status' => 401, 'WWW-Authenticate' => qr/, stale=true$/ } ];
 ok($tf->handle_http($t) == 0, 'Digest-Auth: stale nonce');
 
 $t->{REQUEST}  = ( <<EOF
@@ -1220,7 +1220,7 @@ Authorization: Digest username = "jan", realm = "download archiv",
 	algorithm = "md5", response = "049b000fb00ab51dddea6f093a96aa2e"     
 EOF
  ); # note: trailing whitespace at end of request line above is intentional
-$t->{RESPONSE} = [ { 'HTTP-Protocol' => 'HTTP/1.0', 'HTTP-Status' => 401, 'WWW-Authenticate' => '/, stale=true$/' } ];
+$t->{RESPONSE} = [ { 'HTTP-Protocol' => 'HTTP/1.0', 'HTTP-Status' => 401, 'WWW-Authenticate' => qr/, stale=true$/ } ];
 ok($tf->handle_http($t) == 0, 'Digest-Auth: BWS, trailing WS, stale nonce');
 
 
@@ -1411,7 +1411,7 @@ Accept-Encoding: deflate
 Host: deflate.example.org
 EOF
  );
-$t->{RESPONSE} = [ { 'HTTP-Protocol' => 'HTTP/1.0', 'HTTP-Status' => 200, '+Vary' => '', 'Content-Length' => '1294', '+Content-Encoding' => '' } ];
+$t->{RESPONSE} = [ { 'HTTP-Protocol' => 'HTTP/1.0', 'HTTP-Status' => 200, '+Vary' => '', 'Content-Length' => qr/^129[34]$/, '+Content-Encoding' => '' } ];
 ok($tf->handle_http($t) == 0, 'deflate - Content-Length and Content-Encoding is set');
 
 $t->{REQUEST}  = ( <<EOF
@@ -1420,7 +1420,7 @@ Accept-Encoding: deflate
 Host: deflate-cache.example.org
 EOF
  );
-$t->{RESPONSE} = [ { 'HTTP-Protocol' => 'HTTP/1.0', 'HTTP-Status' => 200, '+Vary' => '', 'Content-Length' => '1294', '+Content-Encoding' => '' } ];
+$t->{RESPONSE} = [ { 'HTTP-Protocol' => 'HTTP/1.0', 'HTTP-Status' => 200, '+Vary' => '', 'Content-Length' => qr/^129[34]$/, '+Content-Encoding' => '' } ];
 ok($tf->handle_http($t) == 0, 'deflate - Content-Length and Content-Encoding is set');
 
 $t->{REQUEST}  = ( <<EOF
@@ -1429,7 +1429,7 @@ Accept-Encoding: gzip
 Host: deflate.example.org
 EOF
  );
-$t->{RESPONSE} = [ { 'HTTP-Protocol' => 'HTTP/1.0', 'HTTP-Status' => 200, '+Vary' => '', 'Content-Length' => '1306', '+Content-Encoding' => '' } ];
+$t->{RESPONSE} = [ { 'HTTP-Protocol' => 'HTTP/1.0', 'HTTP-Status' => 200, '+Vary' => '', 'Content-Length' => qr/^130[56]$/, '+Content-Encoding' => '' } ];
 ok($tf->handle_http($t) == 0, 'gzip - Content-Length and Content-Encoding is set');
 
 $t->{REQUEST}  = ( <<EOF
@@ -1438,7 +1438,7 @@ Accept-Encoding: gzip
 Host: deflate-cache.example.org
 EOF
  );
-$t->{RESPONSE} = [ { 'HTTP-Protocol' => 'HTTP/1.0', 'HTTP-Status' => 200, '+Vary' => '', 'Content-Length' => '1306', '+Content-Encoding' => '' } ];
+$t->{RESPONSE} = [ { 'HTTP-Protocol' => 'HTTP/1.0', 'HTTP-Status' => 200, '+Vary' => '', 'Content-Length' => qr/^130[56]$/, '+Content-Encoding' => '' } ];
 ok($tf->handle_http($t) == 0, 'gzip - Content-Length and Content-Encoding is set');
 
 

@@ -14,7 +14,7 @@
 #include "stat_cache.h"
 #include "plugin.h"
 #include "plugins.h"
-#include "plugin_config.h"  /* config_plugin_value_tobool() */
+#include "plugin_config.h"
 #include "network_write.h"  /* network_write_show_handlers() */
 #include "reqpool.h"        /* request_pool_init() request_pool_free() */
 #include "response.h"       /* http_dispatch[] strftime_cache_reset() */
@@ -360,6 +360,15 @@ static void server_main_setup_signals (void) {
     sigaction(SIGHUP,  &act, NULL);
     sigaction(SIGALRM, &act, NULL);
     sigaction(SIGUSR1, &act, NULL);
+
+   #ifdef __QNX__
+      /*
+       * In QNX SDP 7.1 SA_RESTART is not supported
+       */
+      #ifndef SA_RESTART
+         #define SA_RESTART 0
+      #endif
+   #endif /* __QNX__ */
 
     /* it should be safe to restart syscalls after SIGCHLD */
     act.sa_flags |= SA_RESTART | SA_NOCLDSTOP;

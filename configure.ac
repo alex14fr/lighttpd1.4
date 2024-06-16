@@ -328,16 +328,18 @@ if test "$WITH_DBI" != no; then
     DBI_CFLAGS="-I$WITH_DBI/include"
     DBI_LIBS="-L$WITH_DBI/lib -ldbi"
   else
-    AC_CHECK_HEADERS([dbi/dbi.h],
-      [AC_CHECK_LIB([dbi], [dbi_version],
-        [
-          DBI_CFLAGS=
-          DBI_LIBS="-ldbi"
-        ],
-        [AC_MSG_ERROR([LibDBI not found])]
-      )],
-      [AC_MSG_ERROR([LibDBI header not found])]
-    )
+    PKG_CHECK_MODULES([DBI], [dbi], [], [
+      AC_CHECK_HEADERS([dbi/dbi.h],
+        [AC_CHECK_LIB([dbi], [dbi_version],
+          [
+            DBI_CFLAGS=
+            DBI_LIBS="-ldbi"
+          ],
+          [AC_MSG_ERROR([LibDBI not found])]
+        )],
+        [AC_MSG_ERROR([LibDBI header not found])]
+      )
+    ])
   fi
 
   AC_DEFINE([HAVE_DBI], [1], [LibDBI support])
@@ -930,11 +932,16 @@ if test "$WITH_PCRE" != no; then
     PCRE_LIB="-L$WITH_PCRE/lib -lpcre"
     CPPFLAGS="$CPPFLAGS -I$WITH_PCRE/include"
   else
-    AC_PATH_PROG([PCRECONFIG], [pcre-config])
-    if test -n "$PCRECONFIG"; then
-      PCRE_LIB=`"$PCRECONFIG" --libs`
-      CPPFLAGS="$CPPFLAGS `"$PCRECONFIG" --cflags`"
-    fi
+    PKG_CHECK_MODULES([PCRE], [libpcre], [
+      PCRE_LIB="$PCRE_LIBS"
+      CPPFLAGS="$CPPFLAGS $PCRE_CFLAGS"
+    ], [
+      AC_PATH_PROG([PCRECONFIG], [pcre-config])
+      if test -n "$PCRECONFIG"; then
+        PCRE_LIB=`"$PCRECONFIG" --libs`
+        CPPFLAGS="$CPPFLAGS `"$PCRECONFIG" --cflags`"
+      fi
+    ])
   fi
 
   if test -z "$PCRE_LIB"; then
@@ -1644,7 +1651,6 @@ LIGHTTPD_VERSION_ID=m4_format([0x%x%02x%02x], m4_unquote(m4_split(AC_PACKAGE_VER
 AC_DEFINE_UNQUOTED([LIGHTTPD_VERSION_ID], [$LIGHTTPD_VERSION_ID], [lighttpd-version-id])
 
 AC_CONFIG_FILES([\
-  distribute.sh \
   doc/config/conf.d/Makefile \
   doc/config/Makefile \
   doc/config/vhosts.d/Makefile \
