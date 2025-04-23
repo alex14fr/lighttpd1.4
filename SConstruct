@@ -12,7 +12,7 @@ except NameError:
 	string_types = str
 
 package = 'lighttpd'
-version = '1.4.78'
+version = '1.4.80'
 
 underscorify_reg = re.compile('[^A-Z0-9]')
 def underscorify(id):
@@ -248,7 +248,6 @@ vars.AddVariables(
 	BoolVariable('with_maxminddb', 'enable MaxMind GeoIP2 support', 'no'),
 	BoolVariable('with_krb5', 'enable krb5 auth support', 'no'),
 	BoolVariable('with_ldap', 'enable ldap auth support', 'no'),
-	# with_libev not supported
 	# with_libunwind not supported
 	BoolVariable('with_lua', 'enable lua support', 'no'),
 	PackageVariable('with_mysql', 'enable mysql support', 'no'),

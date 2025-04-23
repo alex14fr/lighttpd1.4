@@ -14,7 +14,7 @@ dnl - if an argument uses more than one line and is not a single
 dnl   function call, the argument should be on different lines than the
 dnl   wrapping braces
 AC_PREREQ([2.60])
-AC_INIT([lighttpd],[1.4.78],[https://redmine.lighttpd.net/projects/lighttpd/boards/2],[lighttpd],[https://www.lighttpd.net/])
+AC_INIT([lighttpd],[1.4.80],[https://redmine.lighttpd.net/projects/lighttpd/boards/2],[lighttpd],[https://www.lighttpd.net/])
 AC_CONFIG_SRCDIR([src/server.c])
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_MACRO_DIR([m4])
@@ -184,19 +184,6 @@ AC_SUBST([DL_LIB])
 
 dnl prepare pkg-config usage below
 PKG_PROG_PKG_CONFIG
-
-dnl checking for libev
-AC_MSG_NOTICE([----------------------------------------])
-AC_MSG_CHECKING([for libev support])
-AC_ARG_WITH([libev],
-  [AS_HELP_STRING([--with-libev@<:@=PATH@:>@],
-    [Include libev support for fdevent handlers in PATH/include and PATH/lib]
-  )],
-  [WITH_LIBEV=$withval],
-  [WITH_LIBEV=no]
-)
-AC_MSG_RESULT([$WITH_LIBEV])
-dnl ignore WITH_LIBEV
 
 dnl Checks for mysql
 AC_MSG_NOTICE([----------------------------------------])
@@ -1323,7 +1310,7 @@ if test "$WITH_LUA" != no; then
     fi
     PKG_CHECK_MODULES([LUA], [$WITH_LUA >= $lua_min_ver],
       [found_lua=1],
-      [AC_MSG_NOTICE([Couldn\'t find requested lua pkg-config module $WITH_LUA])]
+      [AC_MSG_NOTICE([Could not find requested lua pkg-config module $WITH_LUA])]
     )
     if test "$found_lua" = "0"; then
       LUA_LIBS="-L$WITH_LUA -llua"
@@ -1334,12 +1321,12 @@ if test "$WITH_LUA" != no; then
       if test "$found_lua" = "0"; then
         PKG_CHECK_MODULES([LUA], [$luaname >= 5.1],
           [found_lua=1],
-          [AC_MSG_NOTICE([Couldn\'t find $luaname])]
+          [AC_MSG_NOTICE([Could not find $luaname])]
         )
       fi
     done
     if test "$found_lua" = "0"; then
-      AC_MSG_ERROR([Couldn\'t find any lua pkg-config module])
+      AC_MSG_ERROR([Could not find any lua pkg-config module])
     fi
   fi
 
