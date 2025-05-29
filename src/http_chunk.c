@@ -275,6 +275,15 @@ void http_chunk_close(request_st * const r) {
         chunkqueue_append_mem(&r->write_queue, CONST_STR_LEN("0\r\n\r\n"));
 }
 
+__attribute_cold__
+__attribute_noinline__
+static int
+http_chunk_decode_append_error (request_st * const r, const char *errstr)
+{
+    log_error(r->conf.errh, __FILE__, __LINE__, "%s", errstr);
+    return -1;
+}
+
 static int
 http_chunk_decode_append_data (request_st * const r, const char *mem, off_t len)
 {
@@ -292,14 +301,13 @@ http_chunk_decode_append_data (request_st * const r, const char *mem, off_t len)
                 p = memchr(mem, '\n', (size_t)len);
                 if (p) {
                     hsz = (off_t)(++p - mem);
-                    if (p-1 == mem || p[-2] != '\r')
-                        p = NULL; /* flag missing '\r'; p checked again below */
+                    if (p-1 == mem)
+                        p = NULL; /* p checked again below */
                 }
                 else {
                     if (len >= 1024) {
-                        log_error(r->conf.errh, __FILE__, __LINE__,
+                        return http_chunk_decode_append_error(r,
                           "chunked header line too long");
-                        return -1;
                     }
                     buffer_append_string_len(h, mem, (uint32_t)len);
                     break; /* incomplete HTTP chunked header line */
@@ -314,42 +322,45 @@ http_chunk_decode_append_data (request_st * const r, const char *mem, off_t len)
                     p = memchr(mem, '\n', (size_t)len);
                     hsz = (p ? (off_t)(++p - mem) : len);
                     if ((off_t)(1024 - hlen) < hsz) {
-                        log_error(r->conf.errh, __FILE__, __LINE__,
+                        return http_chunk_decode_append_error(r,
                           "chunked header line too long");
-                        return -1;
                     }
                     buffer_append_string_len(h, mem, hsz);
                     if (NULL == p) break;/*incomplete HTTP chunked header line*/
                     mem += hsz;
                     len -= hsz;
                     hsz = 0;
+                    p = h->ptr + buffer_clen(h);
                 }
                 s = (unsigned char *)h->ptr;/*(note: read h->ptr after append)*/
                 /*(non-blank h contains at least one non-'\n' char, plus '\n')*/
-                if (s[buffer_clen(h)-2] != '\r')
-                    p = NULL; /* flag missing '\r'; p checked again below */
             }
 
             for (unsigned char u; (u=(unsigned char)hex2int(*s))!=0xFF; ++s) {
                 if (te_chunked > (off_t)(1uLL<<(8*sizeof(off_t)-5))-1-2) {
-                    log_error(r->conf.errh, __FILE__, __LINE__,
+                    return http_chunk_decode_append_error(r,
                       "chunked data size too large");
-                    return -1;
                 }
                 te_chunked <<= 4;
                 te_chunked |= u;
             }
-            if ((char *)s == mem || (char *)s == h->ptr) /*(no hex)*/
-                p = NULL;
-            else if (*s != '\r') {
-                while (*s == ' ' || *s == '\t') ++s;
-                if (*s != '\r' && *s != ';')
+            if (p != NULL) {
+                if ((char *)s == mem || (char *)s == h->ptr      /*(no hex)*/
+                    || __builtin_expect( (p[-2] != '\r'), 0)) {  /*(no '\r')*/
                     p = NULL;
+                }
+                else if (__builtin_expect( (p-2 != (char *)s), 0)) {
+                    while (*s == ' ' || *s == '\t') ++s;
+                    if (p-2 != (char *)s
+                        && (*s != ';'
+                            || p-2 != memchr((char *)s+1, '\r',
+                                             (size_t)(p - (char *)s - 2))))
+                        p = NULL;
+                }
             }
             if (p == NULL) {
-                log_error(r->conf.errh, __FILE__, __LINE__,
+                return http_chunk_decode_append_error(r,
                   "chunked header invalid chars");
-                return -1;
             }
 
             if (0 == te_chunked) {

@@ -239,6 +239,24 @@ jobs:
     steps:
       - run: git config --global core.autocrlf input
       - uses: actions/checkout@v4
+      - name: Set up env and create cache dir
+        id: env
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value "CACHE_KEY=$(Get-Date -UFormat "%Y-%m")" -Encoding utf8NoBOM
+          New-Item -ItemType Directory -Force -Path D:\cygwin
+      - name: Cache Cygwin installation
+        uses: actions/cache@v3
+        with:
+          path: /cygwin
+          key: cygwin-${{ runner.os }}-${{ env.CACHE_KEY }}
+          restore-keys: |
+            cygwin-${{ runner.os }}-${{ env.CACHE_KEY }}
+      #- name: Create Cygwin package dir under Cygwin cache dir
+      #  shell: pwsh
+      #  run: |
+      #    New-Item -ItemType Directory -Force -Path D:\cygwin\packages
+      #    New-Item -ItemType SymbolicLink -Path D:\cygwin-packages -Target D:\cygwin\packages
       - uses: cygwin/cygwin-install-action@master
         with:
           install-dir: D:\cygwin
@@ -354,6 +372,7 @@ jobs:
         shell: alpine.sh {0}
         run: |
           set -e
+          export SHELL=/bin/sh
           # Alpine Linux wolfssl package built w/o features required by lighttpd
           #('scons check_fullstatic' needs zlib-static openssl-libs-static)
           export NO_WOLFSSL=1
@@ -384,6 +403,7 @@ jobs:
         shell: alpine.sh {0}
         run: |
           set -e
+          export SHELL=/bin/sh
           meson setup "${{github.workspace}}/build" -Dwarning_level=3
           meson compile -C "${{github.workspace}}/build" --verbose
           meson test -C "${{github.workspace}}/build" --verbose
