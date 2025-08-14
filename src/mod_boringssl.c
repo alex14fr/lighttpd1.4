@@ -199,6 +199,7 @@ typedef struct {
 typedef struct {
     STACK_OF(CRYPTO_BUFFER) *names;
     X509_STORE *store;
+    STACK_OF(X509_CRL) *sk_crls;
     const char *crl_file;
     unix_time64_t crl_loadts;
 } plugin_cacerts;
@@ -333,6 +334,348 @@ handler_ctx_free (handler_ctx *hctx)
     if (hctx->kp)
         mod_openssl_kp_rel(hctx->kp);
     free(hctx);
+}
+
+
+__attribute_cold__
+__attribute_noinline__
+static void
+elog (log_error_st * const errh, const char * const file, const int line,
+      const char * const msg)
+{
+    /* error logging convenience function which decodes err codes */
+    char buf[256];
+    ERR_error_string_n(ERR_get_error(), buf, sizeof(buf)); /*(thread-safe)*/
+    log_error(errh, file, line, "SSL: %s %s", msg, buf);
+}
+
+
+__attribute_cold__
+__attribute_format__((__printf__, 4, 5))
+__attribute_noinline__
+static void
+elogf (log_error_st * const errh, const char * const file, const int line,
+       const char * const fmt, ...)
+{
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    elog(errh, file, line, msg);
+}
+
+
+__attribute_cold__
+__attribute_noinline__
+static void
+elogc (handler_ctx * const hctx,
+       const char * const file, const int line, const int ssl_err)
+{
+    char buf[256];
+    uint32_t err;
+    while ((err = ERR_get_error())) {
+        switch (ERR_GET_REASON(err)) {
+          case SSL_R_SSL_HANDSHAKE_FAILURE:
+        #ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+          case SSL_R_UNEXPECTED_EOF_WHILE_READING:
+        #endif
+        #ifdef SSL_R_TLSV1_ALERT_UNKNOWN_CA
+          case SSL_R_TLSV1_ALERT_UNKNOWN_CA:
+        #endif
+        #ifdef SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN
+          case SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN:
+        #endif
+        #ifdef SSL_R_SSLV3_ALERT_BAD_CERTIFICATE
+          case SSL_R_SSLV3_ALERT_BAD_CERTIFICATE:
+        #endif
+            if (!hctx->conf.ssl_log_noise) continue;
+            break;
+          default:
+            break;
+        }
+        ERR_error_string_n(err, buf, sizeof(buf)); /*(thread-safe interface)*/
+        log_error(hctx->r->conf.errh, file, line, "SSL: addr:%s ssl_err:%d %s",
+                  hctx->con->dst_addr_buf.ptr, ssl_err, buf);
+    }
+}
+
+
+#define PEM_BEGIN          "-----BEGIN "
+#define PEM_END            "-----END "
+#define PEM_BEGIN_CERT     "-----BEGIN CERTIFICATE-----"
+#define PEM_END_CERT       "-----END CERTIFICATE-----"
+#define PEM_BEGIN_TRUSTED_CERT "-----BEGIN TRUSTED CERTIFICATE-----"
+#define PEM_END_TRUSTED_CERT   "-----END TRUSTED CERTIFICATE-----"
+#define PEM_BEGIN_PKEY     "-----BEGIN PRIVATE KEY-----"
+#define PEM_END_PKEY       "-----END PRIVATE KEY-----"
+#define PEM_BEGIN_EC_PKEY  "-----BEGIN EC PRIVATE KEY-----"
+#define PEM_END_EC_PKEY    "-----END EC PRIVATE KEY-----"
+#define PEM_BEGIN_RSA_PKEY "-----BEGIN RSA PRIVATE KEY-----"
+#define PEM_END_RSA_PKEY   "-----END RSA PRIVATE KEY-----"
+#define PEM_BEGIN_DSA_PKEY "-----BEGIN DSA PRIVATE KEY-----"
+#define PEM_END_DSA_PKEY   "-----END DSA PRIVATE KEY-----"
+#define PEM_BEGIN_ANY_PKEY "-----BEGIN ANY PRIVATE KEY-----"
+#define PEM_END_ANY_PKEY   "-----END ANY PRIVATE KEY-----"
+/* (not implemented: support to get password from user for encrypted key) */
+#define PEM_BEGIN_ENCRYPTED_PKEY "-----BEGIN ENCRYPTED PRIVATE KEY-----"
+#define PEM_END_ENCRYPTED_PKEY   "-----END ENCRYPTED PRIVATE KEY-----"
+
+#define PEM_BEGIN_X509_CRL "-----BEGIN X509 CRL-----"
+#define PEM_END_X509_CRL   "-----END X509 CRL-----"
+
+
+__attribute_pure__
+static int
+asn1_pem_begins (const struct iovec *iov, const char *label, size_t llen)
+{
+    /*(presumes input string already matched PEM_BEGIN)*/
+    /*assert(llen > (sizeof(PEM_BEGIN)-1) + 4);*/
+    size_t len = iov->iov_len - 1;                   /* remove '\n' */
+    len -= (((char *)iov->iov_base)[len-1] == '\r'); /* remove '\r' */
+    return len == llen /*(compare middle of string until first trailing '-')*/
+        && 0 == memcmp((char *)iov->iov_base + (sizeof(PEM_BEGIN)-1),
+                                       label + (sizeof(PEM_BEGIN)-1),
+                                       llen  - (sizeof(PEM_BEGIN)-1) - 4);
+}
+
+
+__attribute_pure__
+static int
+asn1_pem_begins_pkey (const struct iovec *iov)
+{
+    /*(presumes input string already matched PEM_BEGIN)*/
+    size_t len = iov->iov_len - 1;                   /* remove '\n' */
+    len -= (((char *)iov->iov_base)[len-1] == '\r'); /* remove '\r' */
+    /*(compare middle of string until first trailing '-')*/
+    return len >= (sizeof(PEM_BEGIN)-1) + (sizeof("PRIVATE KEY-")-1) + 4
+        && 0 == memcmp((char *)iov->iov_base
+                         + iov->iov_len
+                         - (iov->iov_len - len)
+                         - (sizeof("PRIVATE KEY-")-1) - 4,
+                       "PRIVATE KEY-", (sizeof("PRIVATE KEY-")-1));
+}
+
+
+static struct iovec *
+asn1_pem_parse_mem (char *data, size_t dlen, size_t *nvec)
+{
+    /* intended for use on small files which are infrequently read;
+     *   not optimized for highest performance */
+    /* (note: using strstr() and strchr() requires that data[dlen] == '\0') */
+    /* (could be written to use memmem(), but not quite as portable) */
+    /* (could be written to walk data once and resize vec as needed) */
+    size_t count = 0;
+    for (char *b = data; (b = strstr(b, PEM_BEGIN)); b += sizeof(PEM_BEGIN)-1)
+        ++count;
+    if (0 == count) {
+        if (NULL == strstr(data, "-----")) {
+            /* does not look like PEM, treat as DER format */
+            *nvec = 1;
+            struct iovec * const iov = ck_malloc(sizeof(struct iovec));
+            iov[0].iov_base = data;
+            iov[0].iov_len  = dlen;
+            return iov;
+        }
+        return NULL;
+    }
+
+    *nvec = count * 3;
+    struct iovec * const vec = ck_calloc(*nvec, sizeof(struct iovec));
+    struct iovec * iov = vec;
+    for (char *b, *e = data; (b = strstr(e, PEM_BEGIN)); iov += 3) {
+        e = strchr(b + sizeof(PEM_BEGIN)-1, '\n');
+        if (NULL == e) break;
+        iov[0].iov_base = b;
+        iov[0].iov_len  = (size_t)(++e - b);
+        iov[1].iov_base = b = e;
+        e = strstr(b, PEM_END);
+        if (NULL == e) break;
+        iov[1].iov_len  = (size_t)(e - b);
+        iov[2].iov_base = b = e;
+        e = strchr(b + sizeof(PEM_END)-1, '\n');
+        if (NULL == e) break;
+        iov[2].iov_len  = (size_t)(++e - b);
+    }
+    if (iov != (vec + *nvec)) {
+        free(vec);
+        return NULL;
+    }
+
+    return vec;
+}
+
+
+/*
+ * Note: nvec == 1 suggests vec[0].iov_base is DER format
+ *       nvec being multiple of 3 is PEM format, 3 iovecs per PEM item
+ *         -----BEGIN ... -----
+ *         <base64-encoded data>
+ *         -----END ... -----
+ *       (If passing each PEM item to a subsequent func for PEM-decoding,
+ *        the PEM item is vec[i].iov_base with length
+ *        (vec[i].iov_len + vec[i+1].iov_len + vec[i+2].iov_len))
+ *
+ * Callback should copy data of interest and should wipe buffers
+ * of sensitive copies (e.g. after base64-decoding PEM -> DER).
+ */
+typedef void *(*asn1_pem_parse_cb)(void *cb_arg, struct iovec *vec, size_t nvec);
+
+
+static void *
+asn1_pem_parse_file (const char *fn, log_error_st *errh, asn1_pem_parse_cb cb, void *cb_arg)
+{
+    /* (note: dlen must be < 4 GB if 64-bit off_t and 32-bit size_t) */
+    off_t dlen = 16*1024*1024;/*(arbitrary limit: 16 MB file; expect < 1 MB)*/
+    char *data = fdevent_load_file(fn, &dlen, errh, malloc, free);
+    if (NULL == data) return NULL;
+
+    size_t nvec;
+    struct iovec *vec = asn1_pem_parse_mem(data, (size_t)dlen, &nvec);
+    void *rv = (NULL != vec) ? cb(cb_arg, vec, nvec) : NULL;
+
+    if (dlen) ck_memzero(data, dlen);
+    free(data);
+
+    return rv;
+}
+
+
+__attribute_cold__
+static void *
+mod_boringssl_pem_parse_certs_cb (void *cb_arg, struct iovec *vec, size_t nvec)
+{
+    CRYPTO_BUFFER **certs;
+    CRYPTO_BUFFER_POOL * const cbpool =
+      *(size_t *)cb_arg ? plugin_data_singleton->cbpool : NULL;
+    /*(cb_arg overloaded as input flag for 'use_pool' or not)*/
+
+    if (1 == nvec) { /* treat data as single DER */
+        certs = ck_malloc(sizeof(CRYPTO_BUFFER *));
+        certs[0] = CRYPTO_BUFFER_new(vec[0].iov_base, vec[0].iov_len, cbpool);
+        if (certs[0] == NULL) {
+            free(certs);
+            return NULL;
+        }
+        *(size_t *)cb_arg = 1; /* ncerts */
+        return certs;
+    }
+
+    size_t ncerts = 0, i;
+    for (i = 0; i < nvec; i += 3) {
+        if (asn1_pem_begins(vec+i, CONST_STR_LEN(PEM_BEGIN_CERT))
+            || asn1_pem_begins(vec+i, CONST_STR_LEN(PEM_BEGIN_TRUSTED_CERT)))
+            vec[ncerts++] = vec[i+1];
+    }
+    if (0 == ncerts)
+        return NULL;
+
+    certs = ck_calloc(ncerts, sizeof(CRYPTO_BUFFER *));
+    buffer * const tb = buffer_init();
+    for (i = 0; i < ncerts; ++i) {
+        buffer_clear(tb);
+        if (NULL == buffer_append_base64_decode(tb, vec[i].iov_base,
+                                                    vec[i].iov_len,
+                                                BASE64_STANDARD))
+            break;
+        certs[i] = CRYPTO_BUFFER_new((uint8_t *)BUF_PTR_LEN(tb), cbpool);
+        if (NULL == certs[i])
+            break;
+    }
+    buffer_free(tb);
+
+    if (i == ncerts) {
+        *(size_t *)cb_arg = ncerts;
+    }
+    else if (certs) {
+        while (i) CRYPTO_BUFFER_free(certs[--i]);
+        free(certs);
+        certs = NULL;
+    }
+
+    return certs;
+}
+
+
+__attribute_cold__
+static void *
+mod_boringssl_pem_parse_evp_pkey_cb (void *cb_arg, struct iovec *vec, size_t nvec)
+{
+    UNUSED(cb_arg);
+
+    if (1 == nvec) { /* treat data as single DER */
+        const uint8_t *d = (uint8_t *)vec[0].iov_base;
+        return d2i_AutoPrivateKey(NULL, &d, vec[0].iov_len);
+    }
+
+    for (size_t i = 0; i < nvec; i += 3) {
+        if (asn1_pem_begins_pkey(vec+i)) {
+            EVP_PKEY *x = NULL;
+            buffer * const tb = buffer_init();
+            const uint8_t *d = (uint8_t *)
+              buffer_append_base64_decode(tb, vec[i+1].iov_base,
+                                              vec[i+1].iov_len,
+                                          BASE64_STANDARD);
+            if (d)
+                x = d2i_AutoPrivateKey(NULL, &d, buffer_clen(tb));
+            ck_memzero(tb->ptr, buffer_clen(tb));
+            buffer_free(tb);
+            return x;
+        }
+    }
+
+    return NULL;
+}
+
+
+__attribute_cold__
+static void *
+mod_boringssl_pem_parse_crls_cb (void *cb_arg, struct iovec *vec, size_t nvec)
+{
+    UNUSED(cb_arg);
+    STACK_OF(X509_CRL) *sk_crls = sk_X509_CRL_new_null();
+
+    if (1 == nvec) { /* treat data as single DER */
+        const uint8_t *dp = (uint8_t *)vec[0].iov_base;
+        X509_CRL *crl = d2i_X509_CRL(NULL, &dp, (long)vec[0].iov_len);
+        if (!crl || !sk_X509_CRL_push(sk_crls, crl)) {
+            X509_CRL_free(crl);
+            sk_X509_CRL_free(sk_crls);
+            return NULL;
+        }
+        return sk_crls;
+    }
+
+    size_t ncrls = 0, i;
+    for (i = 0; i < nvec; i += 3) {
+        if (asn1_pem_begins(vec+i, CONST_STR_LEN(PEM_BEGIN_X509_CRL)))
+            vec[ncrls++] = vec[i+1];
+    }
+    if (0 == ncrls)
+        return NULL;
+
+    buffer * const tb = buffer_init();
+    for (i = 0; i < ncrls; ++i) {
+        buffer_clear(tb);
+        if (NULL == buffer_append_base64_decode(tb, vec[i].iov_base,
+                                                    vec[i].iov_len,
+                                                BASE64_STANDARD))
+            break;
+        const uint8_t *dp = (uint8_t *)tb->ptr;
+        X509_CRL *crl = d2i_X509_CRL(NULL, &dp, (long)buffer_clen(tb));
+        if (!crl || !sk_X509_CRL_push(sk_crls, crl)) {
+            X509_CRL_free(crl);
+            break;
+        }
+    }
+    buffer_free(tb);
+
+    if (i != ncrls) {
+        sk_X509_CRL_pop_free(sk_crls, X509_CRL_free);
+        sk_crls = NULL;
+    }
+
+    return sk_crls;
 }
 
 
@@ -582,10 +925,104 @@ mod_openssl_refresh_ech_key_is_ech_only(plugin_ssl_ctx * const s, const char * c
     return NULL;
 }
 
-#define PEM_BEGIN_PKEY      "-----BEGIN PRIVATE KEY-----"
-#define PEM_END_PKEY        "-----END PRIVATE KEY-----"
 #define PEM_BEGIN_ECHCONFIG "-----BEGIN ECHCONFIG-----"
 #define PEM_END_ECHCONFIG   "-----END ECHCONFIG-----"
+
+struct ech_keys_cb_param {
+  SSL_ECH_KEYS *keys;
+  int is_retry_config;
+  buffer *tmp_buf;
+};
+
+__attribute_cold__
+static void *
+mod_boringssl_pem_parse_ech_keys_cb (void *cb_arg, struct iovec *vec, size_t nvec)
+{
+    struct iovec *vec_pkey = NULL;
+    struct iovec *vec_echconfig = NULL;
+    for (size_t i = 0; i < nvec; i += 3) {
+        if (asn1_pem_begins(vec+i, CONST_STR_LEN(PEM_BEGIN_PKEY))) {
+            if (!vec_pkey) /*(expecting only one; take first one)*/
+                vec_pkey = vec+i+1;
+        }
+        else if (asn1_pem_begins(vec+i, CONST_STR_LEN(PEM_BEGIN_ECHCONFIG))) {
+            if (!vec_echconfig) /*(expecting only one; take first one)*/
+                vec_echconfig = vec+i+1;
+        }
+    }
+    if (!vec_pkey || !vec_echconfig)
+        return NULL;
+
+    int rv = 0;
+    EVP_HPKE_KEY key;
+    EVP_HPKE_KEY_zero(&key);
+    const struct ech_keys_cb_param * const params = cb_arg;
+    buffer * const tb = params->tmp_buf;
+    do {
+        buffer_clear(tb);
+        if (NULL == buffer_append_base64_decode(tb, vec_pkey->iov_base,
+                                                    vec_pkey->iov_len,
+                                                BASE64_STANDARD))
+            break;
+
+        const uint8_t *x = (uint8_t *)tb->ptr;
+        EVP_PKEY *pkey = d2i_AutoPrivateKey(NULL, &x, (long)buffer_clen(tb));
+        /*(BoringSSL tools/bssl outputs raw pkey;
+         * handle if that output is subsequently base64-encoded raw pkey)*/
+        /*if (NULL == pkey) break;*/
+
+        const EVP_HPKE_KEM * const kem = (pkey == NULL)
+          ? EVP_hpke_x25519_hkdf_sha256()
+          : EVP_PKEY_id(pkey) == EVP_PKEY_X25519 /* NID_X25519 */
+          ? EVP_hpke_x25519_hkdf_sha256()
+         #ifndef AWSLC_API_VERSION
+          : EVP_PKEY_id(pkey) == EVP_PKEY_EC /* NID_X9_62_id_ecPublicKey */
+          ? EVP_hpke_p256_hkdf_sha256()
+         #endif
+          : NULL;
+        if (NULL == kem) {
+            EVP_PKEY_free(pkey);
+            break;
+        }
+
+        size_t out_len = buffer_clen(tb); /*should be large enough tmp_buf*/
+        rv = (pkey)
+          ? EVP_PKEY_get_raw_private_key(pkey, (uint8_t *)tb->ptr, &out_len)
+          : 1;
+        EVP_PKEY_free(pkey);
+        if (0 == rv)
+            break;
+        rv = 0;
+
+        EVP_HPKE_KEY_zero(&key);
+        if (!EVP_HPKE_KEY_init(&key, kem, (uint8_t *)tb->ptr, out_len))
+            break;
+
+        ck_memzero(tb->ptr, buffer_clen(tb));
+
+        buffer_clear(tb);
+        if (NULL == buffer_append_base64_decode(tb, vec_echconfig->iov_base,
+                                                    vec_echconfig->iov_len,
+                                                BASE64_STANDARD))
+            break;
+
+        /* OpenSSL tool 'openssl ech' ECHConfig begins with 2-byte len;
+         * BoringSSL 'tool/bssl generate-ech' ECHConfig does not */
+        if (buffer_clen(tb) > 2
+            && (uint32_t)((tb->ptr[0]<<4)|tb->ptr[1]) == buffer_clen(tb)-2){
+            memmove(tb->ptr, tb->ptr+2, buffer_clen(tb)-2);
+            buffer_truncate(tb, buffer_clen(tb)-2);
+        }
+
+        rv = SSL_ECH_KEYS_add(params->keys, params->is_retry_config,
+                              (uint8_t *)BUF_PTR_LEN(tb), &key);
+    } while (0);
+    ck_memzero(tb->ptr, buffer_clen(tb));
+    EVP_HPKE_KEY_cleanup(&key);
+
+    return rv ? params->keys : NULL; /*((void *) 'flag' for success or fail)*/
+}
+
 
 #include "sys-dirent.h"
 static int
@@ -684,106 +1121,16 @@ mod_openssl_refresh_ech_keys_ctx (server * const srv, plugin_ssl_ctx * const s, 
         return 0;
     }
 
+    struct ech_keys_cb_param cb_arg = { keys, 0, srv->tmp_buf };
     int rc = 1;
     for (uint32_t i = 0; i < a.used; ++i) {
         buffer * const n = &a.sorted[i]->key;
+        cb_arg.is_retry_config = ((data_integer *)a.sorted[i])->value;
         buffer_append_path_len(kp, BUF_PTR_LEN(n)); /* *.ech */
 
-        int rv = 0;
-        off_t dlen = 64*1024;/*(arbitrary limit: 64 KB file; expect < 1 KB)*/
-        char *data = fdevent_load_file(kp->ptr, &dlen, srv->errh, malloc, free);
-        EVP_HPKE_KEY key;
-        EVP_HPKE_KEY_zero(&key);
-        buffer * const tb = srv->tmp_buf;
-        buffer_clear(tb);
-        do {
-            if (NULL == data) break;
-
-            char *b, *e;
-            uint32_t len;
-            b = strstr(data, PEM_BEGIN_PKEY);
-            if (NULL == b) break;
-            b += sizeof(PEM_BEGIN_PKEY)-1;
-            if (*b == '\r') ++b;
-            if (*b == '\n') ++b;
-            e = strstr(b, PEM_END_PKEY);
-            if (NULL == e) break;
-            len = (uint32_t)(e - b);
-
-            buffer_clear(tb);
-            if (NULL == buffer_append_base64_decode(tb,b,len,BASE64_STANDARD))
-                break;
-
-            const uint8_t *x = (uint8_t *)tb->ptr;
-            EVP_PKEY *pkey = d2i_AutoPrivateKey(NULL,&x,(long)buffer_clen(tb));
-            /*(BoringSSL tools/bssl outputs raw pkey;
-             * handle if that output is subsequently base64-encoded raw pkey)*/
-            /*if (NULL == pkey) break;*/
-
-            const EVP_HPKE_KEM * const kem = (pkey == NULL)
-              ? EVP_hpke_x25519_hkdf_sha256()
-              : EVP_PKEY_id(pkey) == EVP_PKEY_X25519 /* NID_X25519 */
-              ? EVP_hpke_x25519_hkdf_sha256()
-             #ifndef AWSLC_API_VERSION
-              : EVP_PKEY_id(pkey) == EVP_PKEY_EC /* NID_X9_62_id_ecPublicKey */
-              ? EVP_hpke_p256_hkdf_sha256()
-             #endif
-              : NULL;
-            if (NULL == kem) {
-                EVP_PKEY_free(pkey);
-                break;
-            }
-
-            size_t out_len = buffer_clen(tb); /*(large enough)*/
-            rv = (pkey)
-              ? EVP_PKEY_get_raw_private_key(pkey, (uint8_t *)tb->ptr, &out_len)
-              : 1;
-            EVP_PKEY_free(pkey);
-            if (0 == rv)
-                break;
-            rv = 0;
-
-            EVP_HPKE_KEY_zero(&key);
-            if (!EVP_HPKE_KEY_init(&key, kem, (uint8_t *)tb->ptr, out_len))
-                break;
-
-            ck_memzero(tb->ptr, buffer_clen(tb));
-
-            b = strstr(data, PEM_BEGIN_ECHCONFIG);
-            if (NULL == b) break;
-            b += sizeof(PEM_BEGIN_ECHCONFIG)-1;
-            if (*b == '\r') ++b;
-            if (*b == '\n') ++b;
-            e = strstr(b, PEM_END_ECHCONFIG);
-            if (NULL == e) break;
-            len = (uint32_t)(e - b);
-
-            buffer_clear(tb);
-            if (NULL == buffer_append_base64_decode(tb,b,len,BASE64_STANDARD))
-                break;
-
-            /* OpenSSL tool 'openssl ech' ECHConfig begins with 2-byte len;
-             * BoringSSL 'tool/bssl generate-ech' ECHConfig does not */
-            if (buffer_clen(tb) > 2
-                && (uint32_t)((tb->ptr[0]<<4)|tb->ptr[1]) == buffer_clen(tb)-2){
-                memmove(tb->ptr, tb->ptr+2, buffer_clen(tb)-2);
-                buffer_truncate(tb, buffer_clen(tb)-2);
-            }
-
-            const int is_retry_config = ((data_integer *)a.sorted[i])->value;
-            rv = SSL_ECH_KEYS_add(keys, is_retry_config,
-                                  (uint8_t *)BUF_PTR_LEN(tb), &key);
-        } while (0);
-        ck_memzero(tb->ptr, buffer_clen(tb));
-        EVP_HPKE_KEY_cleanup(&key);
-        if (dlen) ck_memzero(data, dlen);
-        free(data);
-
-        if (0 == rv) {
-            char buf[128];
-            ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
-            log_error(srv->errh, __FILE__, __LINE__,
-                      "SSL: %s: %s", kp->ptr, buf);
+        if (!asn1_pem_parse_file(kp->ptr, srv->errh,
+                                 mod_boringssl_pem_parse_ech_keys_cb, &cb_arg)){
+            elog(srv->errh, __FILE__, __LINE__, kp->ptr);
             rc = 0;
         }
 
@@ -1081,6 +1428,7 @@ mod_openssl_free_config (server *srv, plugin_data * const p)
                     plugin_cacerts *cacerts = cpv->v.v;
                     sk_CRYPTO_BUFFER_pop_free(cacerts->names, CRYPTO_BUFFER_free);
                     X509_STORE_free(cacerts->store);
+                    sk_X509_CRL_pop_free(cacerts->sk_crls, X509_CRL_free);
                     free(cacerts);
                 }
                 break;
@@ -1162,15 +1510,13 @@ mod_boringssl_load_cacerts_x509 (CRYPTO_BUFFER * const * const certs, size_t num
 }
 
 
-static CRYPTO_BUFFER **
-mod_boringssl_load_pem_file (const char *fn, log_error_st *errh, size_t *num_certs, int use_pool);
-
 static plugin_cacerts *
 mod_openssl_load_cacerts (const buffer *ssl_ca_file, log_error_st *errh)
 {
-    size_t num_certs = 0;
-    CRYPTO_BUFFER **certs = /* future: use pool (final arg) */
-      mod_boringssl_load_pem_file(ssl_ca_file->ptr, errh, &num_certs, 0);
+    size_t num_certs = 0; /* overloaded as input param use_pool=0 */
+    CRYPTO_BUFFER **certs =
+      asn1_pem_parse_file(ssl_ca_file->ptr, errh,
+                          mod_boringssl_pem_parse_certs_cb, &num_certs);
     if (NULL == certs) {
         log_error(errh, __FILE__, __LINE__,
           "SSL: valid cert(s) not found in ssl.verifyclient.ca-(dn-)file %s",
@@ -1189,21 +1535,6 @@ mod_openssl_load_cacerts (const buffer *ssl_ca_file, log_error_st *errh)
     free(certs);
 
     return cacerts;
-}
-
-
-static int
-mod_openssl_load_cacrls (X509_STORE *store, const char *ssl_ca_crl_file, server *srv)
-{
-    if (1 != X509_STORE_load_locations(store, ssl_ca_crl_file, NULL))
-    {
-        log_error(srv->errh, __FILE__, __LINE__,
-          "SSL: %s %s", ERR_error_string(ERR_get_error(), NULL),
-          ssl_ca_crl_file);
-        return 0;
-    }
-    X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
-    return 1;
 }
 
 
@@ -1343,102 +1674,230 @@ ssl_info_callback (const SSL *ssl, int where, int ret)
   #endif
 }
 
-/* https://wiki.openssl.org/index.php/Manual:SSL_CTX_set_verify(3)#EXAMPLES */
+
+__attribute_cold__
+__attribute_noinline__
 static int
-verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
+verify_error_trace (handler_ctx *hctx, X509 *x509, int depth, int err)
 {
     char buf[256];
-    X509 *err_cert;
-    int err, depth;
-    SSL *ssl;
-    handler_ctx *hctx;
+    buf[0] = '\0';
+    if (!x509) {
+        /* SSL_get_peer_certificate() would require X509_free() before return */
+        SSL_SESSION *session = SSL_get0_session(hctx->ssl);
+        x509 = session ? SSL_SESSION_get0_peer(session) : NULL;
+    }
+    if (x509)
+        safer_X509_NAME_oneline(X509_get_subject_name(x509), buf, sizeof(buf));
+    if (err == X509_V_OK)
+        err = X509_V_ERR_UNSPECIFIED;
+    log_error(hctx->errh, __FILE__, __LINE__,
+      "SSL: addr:%s verify error:num=%d:%s:depth=%d:subject=%s",
+      hctx->con->dst_addr_buf.ptr,
+      err, X509_verify_cert_error_string(err), depth, buf);
+    if (   err == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY
+        || err == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT) {
+        safer_X509_NAME_oneline(X509_get_issuer_name(x509), buf, sizeof(buf));
+        log_error(hctx->errh, __FILE__, __LINE__,
+          "SSL: addr:%s issuer=%s", hctx->con->dst_addr_buf.ptr, buf);
+    }
+    return err;
+}
 
-    err = X509_STORE_CTX_get_error(ctx);
-    depth = X509_STORE_CTX_get_error_depth(ctx);
 
-    /*
-     * Retrieve the pointer to the SSL of the connection currently treated
-     * and the application specific data stored into the SSL object.
-     */
-    ssl = X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
-    hctx = (handler_ctx *) SSL_get_app_data(ssl);
+/*static enum ssl_verify_result_t*/
+/*custom_verify_callback (SSL *ssl, uint8_t *out_alert)*/
+static int
+mod_boringssl_custom_verify_callback (SSL * const ssl, handler_ctx * const hctx)
+{
+    /*handler_ctx * const hctx = (handler_ctx *) SSL_get_app_data(ssl);*/
 
-    /*
-     * Catch a too long certificate chain. The depth limit set using
-     * SSL_CTX_set_verify_depth() is by purpose set to "limit+1" so
-     * that whenever the "depth>verify_depth" condition is met, we
-     * have violated the limit and want to log this error condition.
-     * We must do it here, because the CHAIN_TOO_LONG error would not
-     * be found explicitly; only errors introduced by cutting off the
-     * additional certificates would be logged.
-     */
-    if (depth > hctx->conf.ssl_verifyclient_depth) {
-        preverify_ok = 0;
-        err = X509_V_ERR_CERT_CHAIN_TOO_LONG;
-        X509_STORE_CTX_set_error(ctx, err);
+    const STACK_OF(CRYPTO_BUFFER) * const peer_certs =
+      SSL_get0_peer_certificates(ssl);
+    if (!peer_certs) { /*(should not happen if custom_verify_callback called)*/
+        /**out_alert = SSL_AD_INTERNAL_ERROR;*/
+        /*return ssl_verify_invalid;*/
+        return verify_error_trace(hctx, NULL, 0, X509_V_ERR_UNSPECIFIED);
     }
 
-    if (preverify_ok && 0 == depth && NULL != hctx->conf.ssl_ca_dn_file) {
-        /* verify that client cert is issued by CA in ssl.ca-dn-file, if set */
-        err_cert = X509_STORE_CTX_get_current_cert(ctx);
-        if (NULL == err_cert) return !hctx->conf.ssl_verifyclient_enforce;
+    if (sk_CRYPTO_BUFFER_num(peer_certs) > hctx->conf.ssl_verifyclient_depth) {
+        /* For a server with a well-defined set of trusted CAs, testing length
+         * of chain provided by client is sufficient, rather than the convoluted
+         * steps in the example provided at the bottom of
+         *   https://docs.openssl.org/master/man3/SSL_CTX_set_verify/
+         * which may be better for a client testing the certificate chain
+         * against a large list of public internet CAs */
+        /**out_alert = SSL_AD_UNKNOWN_CA;*/
+        /*return ssl_verify_invalid;*/
+        return
+          verify_error_trace(hctx, NULL, 0, X509_V_ERR_CERT_CHAIN_TOO_LONG);
+    }
 
+    /* (SSL_get_peer_certificate() would require X509_free() before return)*/
+    SSL_SESSION *session = SSL_get0_session(ssl);
+    X509 * const peer_x509 = session ? SSL_SESSION_get0_peer(session) : NULL;
+    /*if (!peer_x509) return ssl_verify_invalid;*/ /*(should not happen here)*/
+    if (!peer_x509)
+        return verify_error_trace(hctx, NULL, 0, X509_V_ERR_UNSPECIFIED);
+
+    if (hctx->conf.ssl_ca_dn_file) {
         uint8_t *issuer = NULL;
-        int issuer_len = i2d_X509_NAME(X509_get_issuer_name(err_cert), &issuer);
+        /* future: parse issuer from sk_CRYPTO_BUFFER_value(peer_certs, 0) */
+        /* get issuer of peer cert and re-encode name to DER format */
+        int issuer_len = i2d_X509_NAME(X509_get_issuer_name(peer_x509),&issuer);
+
+      #if 0
+        /* copying into CRYPTO_BUFFER and setting stack cmp_func
+         * just to use sk_CRYPTO_BUFFER_find() is excessive
+         * and less efficient than straightforward comparison
+         * (Also, ca_dn_names would need to be sorted at init time,
+         *  and a separate stack kept for ca_dn list sent to client
+         *  in the order given by admin input file (not sorted)) */
+        STACK_OF(CRYPTO_BUFFER) * const ca_dn_names = hctx->conf.ssl_ca_dn_file;
+        if (sk_CRYPTO_BUFFER_find(ca_dn_names, NULL, issuer)) {
+            free(issuer);
+            issuer = NULL;
+        }
+      #else
         if (issuer_len < 0) /*(unexpected)*/
             issuer_len = 0; /*(cause no match and cert rejection below)*/
-        STACK_OF(CRYPTO_BUFFER) * const ca_dn_names = hctx->conf.ssl_ca_dn_file;
-      #if 0
-          /* copying into CRYPTO_BUFFER and setting stack cmp_func
-           * just to use sk_CRYPTO_BUFFER_find() is excessive
-           * and less efficient than straightforward comparison
-           * (Also, ca_dn_names would need to be sorted at init time,
-           *  and a separate stack kept for ca_dn list sent to client
-           *  in the order given by admin input file (not sorted)) */
-        if (sk_CRYPTO_BUFFER_find(ca_dn_names, NULL, cb_issuer))
-            return preverify_ok; /* match */
-      #else
         const size_t ilen = (size_t)issuer_len;
+        STACK_OF(CRYPTO_BUFFER) * const ca_dn_names = hctx->conf.ssl_ca_dn_file;
         for (int i = 0, len = sk_CRYPTO_BUFFER_num(ca_dn_names); i < len; ++i) {
             const CRYPTO_BUFFER *name = sk_CRYPTO_BUFFER_value(ca_dn_names, i);
             if (ilen == CRYPTO_BUFFER_len(name)
                 && 0 == memcmp(CRYPTO_BUFFER_data(name), issuer, ilen)) {
                 free(issuer);
-                return preverify_ok; /* match */
+                issuer = NULL;
+                break; /* match */
             }
         }
-        free(issuer);
+      #endif
+        if (issuer != NULL) {
+            free(issuer);
+            /**out_alert = SSL_AD_BAD_CERTIFICATE;*/
+            /*return ssl_verify_invalid;*/
+            return                               /*?X509_V_ERR_CERT_UNTRUSTED?*/
+              verify_error_trace(hctx, peer_x509, 0, X509_V_ERR_CERT_REJECTED);
+        }
+    }
+
+    return X509_V_OK;
+
+  #if 0 /* handled via app_verify_callback() call to X509_verify_cert() */
+    /* verify client certificate */
+    /* reference: ssl/ssl_x509.cc:ssl_crypto_x509_session_verify_cert_chain() */
+    /* (this block originally coded to be part of custom_verify_callback()) */
+    int rc = -1;
+    X509_STORE_CTX * const store_ctx = X509_STORE_CTX_new();
+    do {
+        if (!store_ctx)
+            break;
+        if (!X509_STORE_CTX_init(store_ctx, hctx->conf.ssl_ca_file->store,
+                                 peer_x509, SSL_get_peer_cert_chain(ssl)))
+            break;
+
+        X509_VERIFY_PARAM * const param = X509_STORE_CTX_get0_param(store_ctx);
+
+      #if 0
+        if (!X509_STORE_CTX_set_default(store_ctx, "ssl_client"))/*client cert*/
+            break;
+      #else
+        X509_VERIFY_PARAM_set_purpose(param, X509_PURPOSE_SSL_CLIENT);
+        X509_VERIFY_PARAM_set_trust(param, X509_TRUST_SSL_CLIENT);
       #endif
 
-        preverify_ok = 0;
-        err = X509_V_ERR_CERT_REJECTED;
-        X509_STORE_CTX_set_error(ctx, err);
-    }
+        /* elide extra calls to get time() to check cert and CRL times */
+        X509_VERIFY_PARAM_set_time_posix(param, (int64_t)log_epoch_secs);
 
-    if (preverify_ok) {
-        return preverify_ok;
-    }
+        /* could set X509_STORE_set_depth() and inherit from X509_STORE
+         * if lighttpd.conf added requirement that ssl.verifyclient.depth
+         * be configured in same context as CA certs and CRLs.
+         * (https://docs.openssl.org/master/man3/SSL_CTX_set_verify/ example
+         *  setting ssl_verifyclient_depth + 1 and checking depth manually
+         *  in SSL_set_verify() with own verify_callback() might be excessive)*/
+        X509_VERIFY_PARAM_set_depth(param, hctx->conf.ssl_verifyclient_depth);
 
-    err_cert = X509_STORE_CTX_get_current_cert(ctx);
-    if (NULL == err_cert) return !hctx->conf.ssl_verifyclient_enforce;
-    safer_X509_NAME_oneline(X509_get_subject_name(err_cert),buf,sizeof(buf));
-    log_error_st *errh = hctx->r->conf.errh;
-    log_error(errh, __FILE__, __LINE__,
-      "SSL: verify error:num=%d:%s:depth=%d:subject=%s",
-      err, X509_verify_cert_error_string(err), depth, buf);
+        if (hctx->conf.ssl_ca_file->sk_crls) {
+            X509_STORE_CTX_set0_crls(store_ctx,hctx->conf.ssl_ca_file->sk_crls);
+            X509_VERIFY_PARAM_set_flags(param, X509_V_FLAG_CRL_CHECK
+                                             | X509_V_FLAG_CRL_CHECK_ALL);
+        }
 
-    /*
-     * At this point, err contains the last verification error. We can use
-     * it for something special
-     */
-    if (!preverify_ok && (err == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY ||
-                          err == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT)) {
-        safer_X509_NAME_oneline(X509_get_issuer_name(err_cert),buf,sizeof(buf));
-        log_error(errh, __FILE__, __LINE__, "SSL: issuer=%s", buf);
-    }
+      #ifndef OPENSSL_NO_ECH
+        /* ClientHelloOuter connections use a different name */
+        const char *name;
+        size_t name_len = 0;
+        SSL_get0_ech_name_override(ssl, &name, &name_len);
+        if (name_len && !X509_VERIFY_PARAM_set1_host(param, name, name_len)))
+            break;
+      #endif
 
-    return !hctx->conf.ssl_verifyclient_enforce;
+        rc = X509_verify_cert(store_ctx);
+        if (1 != rc) {
+            rc = 0;
+            verify_error_trace(hctx, X509_STORE_CTX_get_current_cert(store_ctx),
+                                     X509_STORE_CTX_get_error_depth(store_ctx),
+                                     X509_STORE_CTX_get_error(store_ctx));
+        }
+    } while (0);
+    if (-1 == rc)
+        verify_error_trace(hctx, peer_x509, 0, X509_V_ERR_UNSPECIFIED);
+
+    X509_STORE_CTX_free(store_ctx);
+    return (1 == rc) ? ssl_verify_ok : ssl_verify_invalid;
+  #endif
 }
+
+
+static int
+app_verify_callback (X509_STORE_CTX *store_ctx, void *arg)
+{
+    /* Using SSL_CTX_set_cert_verify_callback() to set app_verify_callback
+     * leverages ssl/ssl_x509.cc:ssl_crypto_x509_session_verify_cert_chain()
+     * to set up X509_STORE_CTX.  app_verify_callback() replaces the call
+     * from ssl/ssl_x509.cc:ssl_crypto_x509_session_verify_cert_chain() to
+     * X509_verify_cert(), but this intercepts and then turn around and call
+     * X509_verify_cert().  This is an alternative to custom_verify_callback
+     * which repaces ssl/ssl_x509.cc:ssl_crypto_x509_session_verify_cert_chain()
+     * and results in custom_verify_callback having to replicate X509_STORE_CTX,
+     * which is very complicated. */
+    UNUSED(arg);
+    SSL * const ssl =
+      X509_STORE_CTX_get_ex_data(store_ctx,
+                                 SSL_get_ex_data_X509_STORE_CTX_idx());
+
+    /* SSL_CTX_set_cert_verify_callback() sets callback on SSL_CTX
+     * Skip verification if client certificate verification is not enabled */
+    handler_ctx * const hctx = (handler_ctx *) SSL_get_app_data(ssl);
+    if (!hctx->conf.ssl_verifyclient) /*(certificates were not requested)*/
+        return 1; /* feign success */
+
+    int rc = mod_boringssl_custom_verify_callback(ssl, hctx);
+    if (rc != X509_V_OK) {
+        X509_STORE_CTX_set_error(store_ctx, rc);
+        return !hctx->conf.ssl_verifyclient_enforce;
+    }
+
+    X509_VERIFY_PARAM * const param = X509_STORE_CTX_get0_param(store_ctx);
+    X509_VERIFY_PARAM_set_time_posix(param, (int64_t)log_epoch_secs);
+    X509_VERIFY_PARAM_set_depth(param, hctx->conf.ssl_verifyclient_depth);
+    if (hctx->conf.ssl_ca_file->sk_crls) {
+        X509_STORE_CTX_set0_crls(store_ctx, hctx->conf.ssl_ca_file->sk_crls);
+        X509_VERIFY_PARAM_set_flags(param, X509_V_FLAG_CRL_CHECK
+                                         | X509_V_FLAG_CRL_CHECK_ALL);
+    }
+
+    rc = X509_verify_cert(store_ctx);
+    if (rc <= 0) {
+        verify_error_trace(hctx, X509_STORE_CTX_get_current_cert(store_ctx),
+                                 X509_STORE_CTX_get_error_depth(store_ctx),
+                                 X509_STORE_CTX_get_error(store_ctx));
+        rc = !hctx->conf.ssl_verifyclient_enforce;
+    }
+    return rc;
+}
+
 
 enum {
   MOD_OPENSSL_ALPN_HTTP11      = 1
@@ -1477,9 +1936,9 @@ mod_openssl_cert_cb (SSL *ssl, void *arg)
     hctx->kp = mod_openssl_kp_acq(pc);
 
     if (1 != SSL_add1_credential(ssl, hctx->kp->cred)) {
-        log_error(hctx->r->conf.errh, __FILE__, __LINE__,
-          "SSL: failed to set cert for TLS server name %s: %s",
-          hctx->r->uri.authority.ptr, ERR_error_string(ERR_get_error(), NULL));
+        elogf(hctx->r->conf.errh, __FILE__, __LINE__,
+          "failed to set cert for TLS server name %s",
+          hctx->r->uri.authority.ptr);
         return 0;
     }
   }
@@ -1505,8 +1964,7 @@ mod_openssl_cert_cb (SSL *ssl, void *arg)
         int mode = SSL_VERIFY_PEER;
         if (hctx->conf.ssl_verifyclient_enforce)
             mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
-        SSL_set_verify(ssl, mode, verify_callback);
-        SSL_set_verify_depth(ssl, hctx->conf.ssl_verifyclient_depth + 1);
+        SSL_set_verify(ssl, mode, NULL);
     }
 
     return 1;
@@ -1519,7 +1977,8 @@ mod_openssl_SNI (handler_ctx *hctx, const char *servername, size_t len)
     request_st * const r = hctx->r;
     if (len >= 1024) { /*(expecting < 256; TLSEXT_MAXLEN_host_name is 255)*/
         log_error(r->conf.errh, __FILE__, __LINE__,
-                  "SSL: SNI name too long %.*s", (int)len, servername);
+          "SSL: addr:%s SNI name too long (%zu) %.*s...",
+          hctx->con->dst_addr_buf.ptr, len, 1024, servername);
         return SSL_TLSEXT_ERR_ALERT_FATAL;
     }
 
@@ -1627,203 +2086,26 @@ mod_boringssl_cert_is_active (CRYPTO_BUFFER *cert)
 }
 
 
-/* BoringSSL OpenSSL compat API does not wipe temp mem used; write our own */
-/* (pemfile might contain private key)*/
-/* code here is based on similar code in mod_nss and mod_wolfssl */
-#include "base64.h"
-
-#define PEM_BEGIN          "-----BEGIN "
-#define PEM_END            "-----END "
-#define PEM_BEGIN_CERT     "-----BEGIN CERTIFICATE-----"
-#define PEM_END_CERT       "-----END CERTIFICATE-----"
-#define PEM_BEGIN_TRUSTED_CERT "-----BEGIN TRUSTED CERTIFICATE-----"
-#define PEM_END_TRUSTED_CERT   "-----END TRUSTED CERTIFICATE-----"
-#ifndef PEM_BEGIN_PKEY
-#define PEM_BEGIN_PKEY     "-----BEGIN PRIVATE KEY-----"
-#endif
-#ifndef PEM_END_PKEY
-#define PEM_END_PKEY       "-----END PRIVATE KEY-----"
-#endif
-#define PEM_BEGIN_EC_PKEY  "-----BEGIN EC PRIVATE KEY-----"
-#define PEM_END_EC_PKEY    "-----END EC PRIVATE KEY-----"
-#define PEM_BEGIN_RSA_PKEY "-----BEGIN RSA PRIVATE KEY-----"
-#define PEM_END_RSA_PKEY   "-----END RSA PRIVATE KEY-----"
-#define PEM_BEGIN_DSA_PKEY "-----BEGIN DSA PRIVATE KEY-----"
-#define PEM_END_DSA_PKEY   "-----END DSA PRIVATE KEY-----"
-#define PEM_BEGIN_ANY_PKEY "-----BEGIN ANY PRIVATE KEY-----"
-#define PEM_END_ANY_PKEY   "-----END ANY PRIVATE KEY-----"
-/* (not implemented: support to get password from user for encrypted key) */
-#define PEM_BEGIN_ENCRYPTED_PKEY "-----BEGIN ENCRYPTED PRIVATE KEY-----"
-#define PEM_END_ENCRYPTED_PKEY   "-----END ENCRYPTED PRIVATE KEY-----"
-
-#define PEM_BEGIN_X509_CRL "-----BEGIN X509 CRL-----"
-#define PEM_END_X509_CRL   "-----END X509 CRL-----"
-
-
-static CRYPTO_BUFFER **
-mod_boringssl_load_pem_file (const char *fn, log_error_st *errh, size_t *num_certs, int use_pool)
-{
-    /* copied/modified from mod_wolfssl.c:mod_wolfssl_load_pem_file()
-     * to store DER list in (CRYPTO_BUFFER **) rather than (buffer *) */
-    /* A more generic func might be written using BoringSSL PEM_read_bio() */
-    off_t dlen = 512*1024*1024;/*(arbitrary limit: 512 MB file; expect < 1 MB)*/
-    char *data = fdevent_load_file(fn, &dlen, errh, malloc, free);
-    if (NULL == data) return NULL;
-
-    CRYPTO_BUFFER_POOL * const cbpool =
-      use_pool ? plugin_data_singleton->cbpool : NULL;
-    CRYPTO_BUFFER **certs = NULL;
-    buffer *tb = NULL;
-    int rc = -1;
-    do {
-        int count = 0;
-        char *b = data;
-        for (; (b = strstr(b, PEM_BEGIN_CERT)); b += sizeof(PEM_BEGIN_CERT)-1)
-            ++count;
-        b = data;
-        for (; (b = strstr(b, PEM_BEGIN_TRUSTED_CERT));
-                b += sizeof(PEM_BEGIN_TRUSTED_CERT)-1)
-            ++count;
-        if (0 == count) {
-            rc = 0;
-            if (NULL == strstr(data, "-----")) {
-                /* does not look like PEM, treat as DER format */
-                *num_certs = 1;
-                certs = ck_malloc(sizeof(CRYPTO_BUFFER *));
-                certs[0] =
-                  CRYPTO_BUFFER_new((uint8_t *)data, (size_t)dlen, cbpool);
-            }
-            break;
-        }
-
-        tb = buffer_init();
-        certs = ck_calloc(count, sizeof(CRYPTO_BUFFER *));
-
-        int i = 0;
-        for (char *e = data; (b = strstr(e, PEM_BEGIN_CERT)); ++i) {
-            b += sizeof(PEM_BEGIN_CERT)-1;
-            if (*b == '\r') ++b;
-            if (*b == '\n') ++b;
-            e = strstr(b, PEM_END_CERT);
-            if (NULL == e) break;
-            uint32_t len = (uint32_t)(e - b);
-            e += sizeof(PEM_END_CERT)-1;
-            if (i >= count) break; /*(should not happen)*/
-            buffer_clear(tb);
-            if (NULL == buffer_append_base64_decode(tb,b,len,BASE64_STANDARD))
-                break;
-            certs[i] = CRYPTO_BUFFER_new((uint8_t *)BUF_PTR_LEN(tb), cbpool);
-            if (NULL == certs[i])
-                break;
-        }
-        for (char *e = data; (b = strstr(e, PEM_BEGIN_TRUSTED_CERT)); ++i) {
-            b += sizeof(PEM_BEGIN_TRUSTED_CERT)-1;
-            if (*b == '\r') ++b;
-            if (*b == '\n') ++b;
-            e = strstr(b, PEM_END_TRUSTED_CERT);
-            if (NULL == e) break;
-            uint32_t len = (uint32_t)(e - b);
-            e += sizeof(PEM_END_TRUSTED_CERT)-1;
-            if (i >= count) break; /*(should not happen)*/
-            buffer_clear(tb);
-            if (NULL == buffer_append_base64_decode(tb,b,len,BASE64_STANDARD))
-                break;
-            certs[i] = CRYPTO_BUFFER_new((uint8_t *)BUF_PTR_LEN(tb), cbpool);
-            if (NULL == certs[i])
-                break;
-        }
-        if (i == count) {
-            rc = 0;
-            *num_certs = (size_t)count;
-        }
-        else
-            errno = EIO;
-    } while (0);
-
-    buffer_free(tb);
-    if (dlen) ck_memzero(data, dlen);
-    free(data);
-
-    if (rc < 0) {
-        log_perror(errh, __FILE__, __LINE__, "error loading %s", fn);
-        if (certs) {
-            for (int i = 0; NULL != certs[i]; ++i)
-                CRYPTO_BUFFER_free(certs[i]);
-            free(certs);
-            certs = NULL;
-        }
-    }
-
-    return certs;
-}
-
-
-static EVP_PKEY *
-mod_openssl_evp_pkey_load_pem_file (const char *file, log_error_st *errh)
-{
-    /* Note: BoringSSL has OpenSSL interface PEM_read_bio_PrivateKey(),
-     * used here, to parse private key from PEM files.  Another option, which
-     * would avoid the BIO interface, would be to parse numerous private key
-     * types out of the PEM ourself, and then call d2i_AutoPrivateKey() as is
-     * done in mod_openssl_refresh_ech_keys_ctx() */
-
-    off_t dlen = 512*1024*1024;/*(arbitrary limit: 512 MB file; expect < 1 MB)*/
-    char *data = fdevent_load_file(file, &dlen, errh, malloc, free);
-    if (NULL == data) return NULL;
-    EVP_PKEY *x = NULL;
-    BIO *in = BIO_new_mem_buf(data, (int)dlen);
-    if (NULL != in) {
-        x = (NULL != strstr(data, "-----"))
-          ? PEM_read_bio_PrivateKey(in, NULL, NULL, NULL)
-          : d2i_PrivateKey_bio(in, NULL);
-        BIO_free(in);
-    }
-    if (dlen) ck_memzero(data, dlen);
-    free(data);
-
-    if (NULL == in)
-        log_error(errh, __FILE__, __LINE__,
-          "SSL: BIO_new/BIO_read_filename('%s') failed", file);
-    else if (NULL == x)
-        log_error(errh, __FILE__, __LINE__,
-          "SSL: couldn't read private key from '%s'", file);
-
-    return x;
-}
-
-
 __attribute_noinline__
 static int
 mod_openssl_reload_crl_file (server *srv, plugin_cacerts *cacerts, const unix_time64_t cur_ts)
 {
     /* CRLs can be updated at any time, though expected on/before Next Update */
-    X509_STORE * const new_store = X509_STORE_new();
-    if (NULL == new_store)
-        return 0;
-    X509_STORE * const store = cacerts->store;
-    int rc = 1;
-    /* duplicate X509_STORE with X509 objects and skip CRLs */
-    /* (modelled off X509_STORE_get1_all_certs()) */
-    /*X509_STORE_lock(store);*/
-    STACK_OF(X509_OBJECT) *objs = X509_STORE_get0_objects(store);
-    for (int i = 0, num = sk_X509_OBJECT_num(objs); i < num && rc; ++i) {
-        X509 *cert = X509_OBJECT_get0_X509(sk_X509_OBJECT_value(objs, i));
-        if (cert != NULL)
-            rc = X509_STORE_add_cert(new_store, cert);
+    STACK_OF(X509_CRL) *sk_crls =
+      asn1_pem_parse_file(cacerts->crl_file, srv->errh,
+                          mod_boringssl_pem_parse_crls_cb, NULL);
+    /* XXX: not thread-safe if another thread has pointer to sk_crls
+     * and is about to perform client certificate verification */
+    if (sk_crls) {
+        sk_X509_CRL_pop_free(cacerts->sk_crls, X509_CRL_free);
+        cacerts->sk_crls = sk_crls;
+        cacerts->crl_loadts = cur_ts;
     }
-    /*X509_STORE_unlock(store);*/
+    else
+        log_error(srv->errh, __FILE__, __LINE__,
+          "SSL: error parsing %s", cacerts->crl_file);
 
-    if (rc) {
-        rc = mod_openssl_load_cacrls(new_store, cacerts->crl_file, srv);
-        if (rc) {
-            cacerts->crl_loadts = cur_ts;
-            cacerts->store = new_store;
-        }
-    }
-    /* XXX: not thread-safe if another thread has pointer to store and is about
-     * to perform client certificate verification */
-    X509_STORE_free(rc ? store : new_store);
-    return rc;
+    return (sk_crls != NULL);
 }
 
 
@@ -2009,20 +2291,27 @@ network_openssl_load_pemfile (server *srv, const buffer *pemfile, const buffer *
     if (!mod_openssl_init_once_openssl(srv)) return NULL;
 
     EVP_PKEY *ssl_pemfile_pkey =
-      mod_openssl_evp_pkey_load_pem_file(privkey->ptr, srv->errh);
-    if (NULL == ssl_pemfile_pkey)
+      asn1_pem_parse_file(privkey->ptr, srv->errh,
+                          mod_boringssl_pem_parse_evp_pkey_cb, NULL);
+    if (NULL == ssl_pemfile_pkey) {
+        log_error(srv->errh, __FILE__, __LINE__,
+          "SSL: couldn't read private key from '%s'", privkey->ptr);
         return NULL;
+    }
 
-    size_t ssl_pemfile_chain = 0;
+    size_t ssl_pemfile_chain = 1; /* overloaded as input param use_pool=1 */
     CRYPTO_BUFFER **ssl_pemfile_x509 =
-      mod_boringssl_load_pem_file(pemfile->ptr, srv->errh, &ssl_pemfile_chain, 1);
+      asn1_pem_parse_file(pemfile->ptr, srv->errh,
+                          mod_boringssl_pem_parse_certs_cb, &ssl_pemfile_chain);
     if (NULL == ssl_pemfile_x509) {
+        log_error(srv->errh, __FILE__, __LINE__,
+          "SSL: error parsing %s", pemfile->ptr);
         EVP_PKEY_free(ssl_pemfile_pkey);
         return NULL;
     }
     if (!mod_boringssl_cert_is_active(ssl_pemfile_x509[0]))
         log_error(srv->errh, __FILE__, __LINE__,
-          "SSL: inactive/expired X509 certificate '%s'",ssl_stapling_file->ptr);
+          "SSL: inactive/expired X509 certificate '%s'", pemfile->ptr);
 
     plugin_cert *pc = ck_malloc(sizeof(plugin_cert));
     mod_openssl_kp * const kp = pc->kp = mod_openssl_kp_init();
@@ -2040,10 +2329,8 @@ network_openssl_load_pemfile (server *srv, const buffer *pemfile, const buffer *
     if (!SSL_CREDENTIAL_set1_cert_chain(kp->cred, ssl_pemfile_x509,
                                         ssl_pemfile_chain)
         || !SSL_CREDENTIAL_set1_private_key(kp->cred, ssl_pemfile_pkey)) {
-        log_error(srv->errh, __FILE__, __LINE__, "SSL:"
-          "SSL_CREDENTIAL init failed; reason: %s %s %s",
-          ERR_error_string(ERR_get_error(), NULL),
-          pemfile->ptr, privkey->ptr);
+        elogf(srv->errh, __FILE__, __LINE__,
+          "SSL_CREDENTIAL init %s %s", pemfile->ptr, privkey->ptr);
         mod_openssl_kp_free(kp);
         free(pc);
         return NULL;
@@ -2063,7 +2350,7 @@ network_openssl_load_pemfile (server *srv, const buffer *pemfile, const buffer *
       #endif
     }
     else if (kp->must_staple) {
-        log_error(srv->errh, __FILE__, __LINE__,
+        log_error(srv->errh, __FILE__, __LINE__, "SSL:"
                   "certificate %s marked OCSP Must-Staple, "
                   "but ssl.stapling-file not provided", pemfile->ptr);
     }
@@ -2113,7 +2400,9 @@ mod_openssl_acme_tls_1 (SSL *ssl, handler_ctx *hctx)
 
     do {
         buffer_append_string_len(b, CONST_STR_LEN(".key.pem"));
-        ssl_pemfile_pkey = mod_openssl_evp_pkey_load_pem_file(b->ptr, errh);
+        ssl_pemfile_pkey =
+          asn1_pem_parse_file(b->ptr, errh,
+                              mod_boringssl_pem_parse_evp_pkey_cb, NULL);
         if (NULL == ssl_pemfile_pkey) {
             log_error(errh, __FILE__, __LINE__,
               "SSL: Failed to load acme-tls/1 pemfile: %s", b->ptr);
@@ -2123,7 +2412,8 @@ mod_openssl_acme_tls_1 (SSL *ssl, handler_ctx *hctx)
         buffer_truncate(b, len); /*(remove ".key.pem")*/
         buffer_append_string_len(b, CONST_STR_LEN(".crt.pem"));
         ssl_pemfile_x509 =
-          mod_boringssl_load_pem_file(b->ptr, errh, &ssl_pemfile_chain, 0);
+          asn1_pem_parse_file(b->ptr, errh, mod_boringssl_pem_parse_certs_cb,
+                              &ssl_pemfile_chain);/* overloaded as use_pool=0 */
         if (NULL == ssl_pemfile_x509) {
             log_error(errh, __FILE__, __LINE__,
               "SSL: Failed to load acme-tls/1 pemfile: %s", b->ptr);
@@ -2135,9 +2425,9 @@ mod_openssl_acme_tls_1 (SSL *ssl, handler_ctx *hctx)
                                        ssl_pemfile_chain, /* num_certs */
                                        ssl_pemfile_pkey,
                                        NULL)) {
-            log_error(errh, __FILE__, __LINE__,
-              "SSL: failed to set acme-tls/1 certificate for TLS server "
-              "name %s: %s", name->ptr, ERR_error_string(ERR_get_error(),NULL));
+            elogf(errh, __FILE__, __LINE__,
+              "failed to set acme-tls/1 certificate for TLS server name %s",
+              name->ptr);
             break;
         }
 
@@ -2163,13 +2453,15 @@ mod_openssl_alpn_h2_policy (handler_ctx * const hctx)
   #if 0 /* SNI omitted by client when connecting to IP instead of to name */
     if (buffer_is_blank(&hctx->r->uri.authority)) {
         log_error(hctx->errh, __FILE__, __LINE__,
-          "SSL: error ALPN h2 without SNI");
+          "SSL: addr:%s error ALPN h2 without SNI",
+          hctx->con->dst_addr_buf.ptr);
         return -1;
     }
   #endif
     if (SSL_version(hctx->ssl) < TLS1_2_VERSION) {
         log_error(hctx->errh, __FILE__, __LINE__,
-          "SSL: error ALPN h2 requires TLSv1.2 or later");
+          "SSL: addr:%s error ALPN h2 requires TLSv1.2 or later",
+          hctx->con->dst_addr_buf.ptr);
         return -1;
     }
 
@@ -2294,6 +2586,17 @@ mod_openssl_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *
 }
 
 
+static void
+li_get_current_time (const SSL *ssl, struct timeval *out_clock)
+{
+    /* use cached time in sec since already available; elide excess time() calls
+     * (note: *inappropriate* for DTLS, which uses higher precision timers)
+     * (this lighttpd module does not currently support DTLS) */
+    UNUSED(ssl);
+    out_clock->tv_sec = log_epoch_secs;
+    out_clock->tv_usec = 0;
+}
+
 static int mod_boringssl_verifyclient_selective;
 
 static int
@@ -2319,11 +2622,16 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
                                  ? TLS_with_buffers_method()
                                  : TLS_server_method());
         if (NULL == s->ssl_ctx) {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+            elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_new");
             return -1;
         }
         SSL_CTX_set0_buffer_pool(s->ssl_ctx, p->cbpool);
+        /* use cached time since already available; elide excess time() calls
+         * (note: *inappropriate* for DTLS, which uses higher precision timers)
+         * (this lighttpd module does not currently support DTLS) */
+        /* (while intended for testing, prototype is public in openssl/ssl.h) */
+        SSL_CTX_set_current_time_cb(s->ssl_ctx, li_get_current_time);
+        SSL_CTX_set_cert_verify_callback(s->ssl_ctx, app_verify_callback, NULL);
 
       #ifdef SSL_OP_NO_RENEGOTIATION /* openssl 1.1.0 */
         ssloptions |= SSL_OP_NO_RENEGOTIATION;
@@ -2333,9 +2641,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
          * required for client cert verification to work with sessions */
         if (0 == SSL_CTX_set_session_id_context(
                    s->ssl_ctx,(const unsigned char*)CONST_STR_LEN("lighttpd"))){
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: failed to set session context: %s",
-              ERR_error_string(ERR_get_error(), NULL));
+            elog(srv->errh,__FILE__,__LINE__,"SSL_CTX_set_session_id_context");
             return -1;
         }
 
@@ -2356,8 +2662,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
             if ((SSL_OP_NO_SSLv2
                  & SSL_CTX_set_options(s->ssl_ctx, SSL_OP_NO_SSLv2))
                 != SSL_OP_NO_SSLv2) {
-                log_error(srv->errh, __FILE__, __LINE__,
-                  "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+                elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_set_options");
                 return -1;
             }
         }
@@ -2367,8 +2672,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
             if ((SSL_OP_NO_SSLv3
                  & SSL_CTX_set_options(s->ssl_ctx, SSL_OP_NO_SSLv3))
                 != SSL_OP_NO_SSLv3) {
-                log_error(srv->errh, __FILE__, __LINE__,
-                  "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+                elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_set_options");
                 return -1;
             }
         }
@@ -2376,8 +2680,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
         if (s->ssl_cipher_list) {
             /* Disable support for low encryption ciphers */
             if (SSL_CTX_set_cipher_list(s->ssl_ctx,s->ssl_cipher_list->ptr)!=1){
-                log_error(srv->errh, __FILE__, __LINE__,
-                  "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+                elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_set_cipher_list");
                 return -1;
             }
 
@@ -3017,32 +3320,31 @@ SETDEFAULTS_FUNC(mod_openssl_set_defaults)
 }
 
 
+static void
+mod_openssl_detach(handler_ctx *hctx);
+
+
 __attribute_cold__
 static int
-mod_openssl_write_err (SSL * const ssl, int wr, connection * const con,
-                       log_error_st * const errh)
+mod_openssl_write_err (handler_ctx * const restrict hctx, int wr)
 {
-    int ssl_r;
-    unsigned long err;
-
-    switch ((ssl_r = SSL_get_error(ssl, wr))) {
+    /* Note: caller calls ERR_clear_error() before SSL_write() */
+    const int ssl_err = SSL_get_error(hctx->ssl, wr);
+    switch (ssl_err) {
       case SSL_ERROR_WANT_READ:
-        con->is_readable = -1;
+        hctx->con->is_readable = -1;
         return 0; /* try again later */
       case SSL_ERROR_WANT_WRITE:
-        con->is_writable = -1;
+        hctx->con->is_writable = -1;
         return 0; /* try again later */
+      case SSL_ERROR_ZERO_RETURN:
+        /* clean shutdown on the remote side */
+        if (wr == 0) return -2;
+        __attribute_fallthrough__
       case SSL_ERROR_SYSCALL:
-        /* perhaps we have error waiting in our error-queue */
-        if (0 != (err = ERR_get_error())) {
-            do {
-                log_error(errh, __FILE__, __LINE__,
-                  "SSL: %d %d %s",ssl_r,wr,ERR_error_string(err,NULL));
-            } while ((err = ERR_get_error()));
-        }
-        else if (wr == -1) {
-            /* no, but we have errno */
-            switch (errno) {
+        {
+            int errnum = errno;
+            switch (errnum) {
               case EAGAIN:
              #ifdef EWOULDBLOCK
              #if EWOULDBLOCK != EAGAIN
@@ -3056,32 +3358,29 @@ mod_openssl_write_err (SSL * const ssl, int wr, connection * const con,
                 return 0; /* try again later */
               case EPIPE:
               case ECONNRESET:
+               #if 0
+                if (hctx->conf.ssl_log_noise)
+                    log_perror(hctx->errh, __FILE__, __LINE__,
+                      "SSL: addr:%s ssl_err:%d errno:%d",
+                      hctx->con->dst_addr_buf.ptr, ssl_err, errnum);
+               #endif
+                mod_openssl_detach(hctx); /*non-recoverable; skip CLOSE_NOTIFY*/
                 return -2;
               default:
-                log_perror(errh, __FILE__, __LINE__,
-                  "SSL: %d %d", ssl_r, wr);
+                if (0 == ERR_peek_error())
+                    log_perror(hctx->errh, __FILE__, __LINE__,
+                      "SSL: addr:%s ssl_err:%d wr:%d errno:%d",
+                      hctx->con->dst_addr_buf.ptr, ssl_err, wr, errnum);
                 break;
             }
         }
-        else {
-            /* neither error-queue nor errno ? */
-            log_perror(errh, __FILE__, __LINE__,
-              "SSL (error): %d %d", ssl_r, wr);
-        }
         break;
-
-      case SSL_ERROR_ZERO_RETURN:
-        /* clean shutdown on the remote side */
-        if (wr == 0) return -2;
-
-        __attribute_fallthrough__
       default:
-        while ((err = ERR_get_error()))
-            log_error(errh, __FILE__, __LINE__,
-              "SSL: %d %d %s", ssl_r, wr, ERR_error_string(err, NULL));
         break;
     }
 
+    elogc(hctx, __FILE__, __LINE__, ssl_err);
+    mod_openssl_detach(hctx); /* non-recoverable; skip CLOSE_NOTIFY */
     return -1;
 }
 
@@ -3110,8 +3409,6 @@ static int
 connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t max_bytes)
 {
     handler_ctx * const hctx = con->plugin_ctx[plugin_data_singleton->id];
-    SSL * const ssl = hctx->ssl;
-    log_error_st * const errh = hctx->errh;
 
     if (__builtin_expect( (0 != hctx->close_notify), 0))
         return mod_openssl_close_notify(hctx);
@@ -3123,7 +3420,8 @@ connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t ma
           : (uint32_t)max_bytes;
         int wr;
 
-        if (0 != chunkqueue_peek_data(cq, &data, &data_len, errh, 1)) return -1;
+        if (0 != chunkqueue_peek_data(cq, &data, &data_len, hctx->errh, 1))
+            return -1;
         if (__builtin_expect( (0 == data_len), 0)) {
             if (!cq->first->file.busy)
                 chunkqueue_remove_finished_chunks(cq);
@@ -3140,16 +3438,17 @@ connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t ma
          */
 
         ERR_clear_error();
-        wr = SSL_write(ssl, data, data_len);
+        wr = SSL_write(hctx->ssl, data, data_len);
 
         if (__builtin_expect( (hctx->renegotiations > 1), 0)) {
-            log_error(errh, __FILE__, __LINE__,
-              "SSL: renegotiation initiated by client, killing connection");
+            log_error(hctx->errh, __FILE__, __LINE__,
+              "SSL: addr:%s renegotiation initiated by client, "
+              "killing connection", con->dst_addr_buf.ptr);
             return -1;
         }
 
         if (wr <= 0)
-            return mod_openssl_write_err(ssl, wr, con, errh);
+            return mod_openssl_write_err(hctx, wr);
 
         chunkqueue_mark_written(cq, wr);
 
@@ -3193,8 +3492,8 @@ connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max
 
         if (hctx->renegotiations > 1) {
             log_error(hctx->errh, __FILE__, __LINE__,
-              "SSL: renegotiation initiated by client, killing connection (%s)",
-              con->dst_addr_buf.ptr);
+              "SSL: addr:%s renegotiation initiated by client, "
+              "killing connection", con->dst_addr_buf.ptr);
             return -1;
         }
 
@@ -3219,9 +3518,8 @@ connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max
     } while (len > 0 && (pend = SSL_pending(hctx->ssl)) > 0);
 
     if (len < 0) {
-        int oerrno = errno;
-        int rc, ssl_err;
-        switch ((rc = SSL_get_error(hctx->ssl, len))) {
+        const int ssl_err = SSL_get_error(hctx->ssl, len);
+        switch (ssl_err) {
         case SSL_ERROR_WANT_WRITE:
             con->is_writable = -1;
             __attribute_fallthrough__
@@ -3248,32 +3546,32 @@ connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max
              *   errno for details).
              *
              */
-            while((ssl_err = ERR_get_error())) {
-                /* get all errors from the error-queue */
-                log_error(hctx->errh, __FILE__, __LINE__,
-                  "SSL: %d %s", rc, ERR_error_string(ssl_err, NULL));
-            }
-
-            switch(oerrno) {
+           {
+            const int errnum = errno;
+            switch(errnum) {
+            case EPIPE:
             case ECONNRESET:
                 if (!hctx->conf.ssl_log_noise) break;
                 __attribute_fallthrough__
             default:
-                /* (oerrno should be something like ECONNABORTED not 0
+                /* (errnum should be something like ECONNABORTED not 0
                  *  if client disconnected before anything was sent
                  *  (e.g. TCP connection probe), but it does not appear
                  *  that openssl provides such notification, not even
                  *  something like SSL_R_SSL_HANDSHAKE_FAILURE) */
-                if (0==oerrno && 0==cq->bytes_in && !hctx->conf.ssl_log_noise)
+                if (0==errnum && 0==cq->bytes_in && !hctx->conf.ssl_log_noise)
                     break;
 
-                errno = oerrno; /*(for log_perror())*/
-                log_perror(hctx->errh, __FILE__, __LINE__,
-                  "SSL: %d %d %d", len, rc, oerrno);
+                if (0 == ERR_peek_error())
+                    log_perror(hctx->errh, __FILE__, __LINE__,
+                      "SSL: addr:%s ssl_err:%d rd:%d errno:%d",
+                      con->dst_addr_buf.ptr, ssl_err, len, errnum);
+                else
+                    elogc(hctx, __FILE__, __LINE__, ssl_err);
                 break;
             }
-
             break;
+           }
         case SSL_ERROR_ZERO_RETURN:
             /* clean shutdown on the remote side */
 
@@ -3287,33 +3585,11 @@ connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max
 
             /*__attribute_fallthrough__*/
         default:
-            while((ssl_err = ERR_get_error())) {
-                switch (ERR_GET_REASON(ssl_err)) {
-                case SSL_R_SSL_HANDSHAKE_FAILURE:
-              #ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
-                case SSL_R_UNEXPECTED_EOF_WHILE_READING:
-              #endif
-              #ifdef SSL_R_TLSV1_ALERT_UNKNOWN_CA
-                case SSL_R_TLSV1_ALERT_UNKNOWN_CA:
-              #endif
-              #ifdef SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN
-                case SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN:
-              #endif
-              #ifdef SSL_R_SSLV3_ALERT_BAD_CERTIFICATE
-                case SSL_R_SSLV3_ALERT_BAD_CERTIFICATE:
-              #endif
-                    if (!hctx->conf.ssl_log_noise) continue;
-                    break;
-                default:
-                    break;
-                }
-                /* get all errors from the error-queue */
-                log_error(hctx->errh, __FILE__, __LINE__,
-                  "SSL: %d %s (%s)", rc, ERR_error_string(ssl_err, NULL),
-                  con->dst_addr_buf.ptr);
-            }
+            /* get all errors from the error-queue */
+            elogc(hctx, __FILE__, __LINE__, ssl_err);
             break;
         }
+        mod_openssl_detach(hctx); /* non-recoverable; skip CLOSE_NOTIFY */
         return -1;
     } else if (len == 0) {
         con->is_readable = 0;
@@ -3363,8 +3639,7 @@ CONNECTION_FUNC(mod_openssl_handle_con_accept)
         return HANDLER_GO_ON;
     }
     else {
-        log_error(r->conf.errh, __FILE__, __LINE__,
-          "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+        elog(hctx->r->conf.errh, __FILE__, __LINE__, "accept");
         return HANDLER_ERROR;
     }
 }
@@ -3387,7 +3662,7 @@ CONNECTION_FUNC(mod_openssl_handle_con_shut_wr)
 {
     plugin_data *p = p_d;
     handler_ctx *hctx = con->plugin_ctx[p->id];
-    if (NULL == hctx) return HANDLER_GO_ON;
+    if (NULL == hctx || 1 == hctx->close_notify) return HANDLER_GO_ON;
 
     hctx->close_notify = -2;
     if (SSL_is_init_finished(hctx->ssl)) {
@@ -3405,16 +3680,13 @@ static int
 mod_openssl_close_notify(handler_ctx *hctx)
 {
         int ret, ssl_r;
-        unsigned long err;
-        log_error_st *errh;
 
         if (1 == hctx->close_notify) return -2;
 
         ERR_clear_error();
         switch ((ret = SSL_shutdown(hctx->ssl))) {
         case 1:
-            mod_openssl_detach(hctx);
-            return -2;
+            break;
         case 0:
             /* Drain SSL read buffers in case pending records need processing.
              * Limit to reading next record to avoid denial of service when CPU
@@ -3445,60 +3717,54 @@ mod_openssl_close_notify(handler_ctx *hctx)
             }
 
             ERR_clear_error();
-            switch ((ret = SSL_shutdown(hctx->ssl))) {
-            case 1:
-                mod_openssl_detach(hctx);
-                return -2;
-            case 0:
-                hctx->close_notify = -1;
-                return 0;
-            default:
+            ret = SSL_shutdown(hctx->ssl);
+            if (1 == ret)
                 break;
+            else if (0 == ret) {
+                hctx->close_notify = -1;
+                return 0; /* try again later */
             }
 
             __attribute_fallthrough__
         default:
 
-            if (!SSL_is_init_finished(hctx->ssl)) {
-                mod_openssl_detach(hctx);
-                return -2;
-            }
+            if (!SSL_is_init_finished(hctx->ssl))
+                break;
 
             switch ((ssl_r = SSL_get_error(hctx->ssl, ret))) {
             case SSL_ERROR_WANT_WRITE:
             case SSL_ERROR_WANT_READ:
-            case SSL_ERROR_ZERO_RETURN: /*(unexpected here)*/
                 hctx->close_notify = -1;
                 return 0; /* try again later */
             case SSL_ERROR_SYSCALL:
-                if (0 == ERR_peek_error()) {
-                    switch(errno) {
+                {
+                    const int errnum = errno;
+                    switch (errnum) {
                     case 0: /*ssl bug (see lighttpd ticket #2213)*/
                     case EPIPE:
                     case ECONNRESET:
-                        mod_openssl_detach(hctx);
-                        return -2;
+                        break;
                     default:
-                        log_perror(hctx->r->conf.errh, __FILE__, __LINE__,
-                          "SSL (error): %d %d", ssl_r, ret);
+                        if (0 == ERR_peek_error())
+                            log_perror(hctx->r->conf.errh, __FILE__, __LINE__,
+                              "SSL: addr:%s ssl_err:%d ret:%d errno:%d",
+                              hctx->con->dst_addr_buf.ptr, ssl_r, ret, errnum);
+                        else
+                            elogc(hctx, __FILE__, __LINE__, ssl_r);
                         break;
                     }
-                    break;
                 }
-                __attribute_fallthrough__
+                break;
             default:
-                errh = hctx->r->conf.errh;
-                while((err = ERR_get_error())) {
-                    log_error(errh, __FILE__, __LINE__,
-                      "SSL: %d %d %s", ssl_r, ret, ERR_error_string(err, NULL));
-                }
-
+                elogc(hctx, __FILE__, __LINE__, ssl_r);
                 break;
             }
+
+            break;
         }
-        ERR_clear_error();
-        hctx->close_notify = -1;
-        return ret;
+
+        mod_openssl_detach(hctx);
+        return -2;
 }
 
 
@@ -3758,9 +4024,9 @@ mod_openssl_refresh_plugin_ssl_ctx (server * const srv, plugin_ssl_ctx * const s
   #if 0 /* disabled due to openssl quirks selecting incorrect certificate */
     /* BoringSSL certificate selection also does not currently check SNI */
     if (1 != SSL_CTX_add1_credential(s->ssl_ctx, s->kp->cred)) {
-        log_error(srv->errh, __FILE__, __LINE__,
-          "SSL: %s %s %s", ERR_error_string(ERR_get_error(), NULL),
-          s->pc->ssl_pemfile->ptr, s->pc->ssl_privkey->ptr);
+        elogf(srv->errh, __FILE__, __LINE__,
+          "SSL_CTX_add1_credential %s %s",
+          s->pc->pemfile->ptr, s->pc->privkey->ptr);
         /* no recovery until admin fixes input files */
     }
   #else
@@ -4076,8 +4342,7 @@ mod_openssl_ssl_conf_cmd (server *srv, plugin_config_socket *s)
       #if 0
         /* SSL_CTX_set_ciphersuites() not implemented in BoringSSL */
         if (SSL_CTX_set_ciphersuites(s->ssl_ctx, ciphersuites->ptr) != 1) {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+            elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_set_ciphersuites");
             rc = -1;
         }
       #endif
@@ -4088,8 +4353,7 @@ mod_openssl_ssl_conf_cmd (server *srv, plugin_config_socket *s)
         buffer_append_string_len(cipherstring,
                                  CONST_STR_LEN(":!aNULL:!eNULL:!EXP"));
         if (SSL_CTX_set_cipher_list(s->ssl_ctx, cipherstring->ptr) != 1) {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+            elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_set_cipher_list");
             rc = -1;
         }
 

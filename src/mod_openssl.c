@@ -70,6 +70,18 @@
 #ifndef OPENSSL_NO_OCSP
 #include <openssl/ocsp.h>
 #endif
+#ifdef AWSLC_API_VERSION /* alt: OPENSSL_IS_AWSLC */
+/* AWS-LC derived from BoringSSL, but AWSLC_API_VERSION has different meaning.
+ * Reuse BORINGSSL_API_VERSION for (presently) small num of API version checks*/
+#ifndef BORINGSSL_API_VERSION
+#define BORINGSSL_API_VERSION 19
+#endif
+#endif
+#ifdef BORINGSSL_API_VERSION
+#include <openssl/hmac.h>
+/* BoringSSL purports to have some OCSP support */
+#undef OPENSSL_NO_OCSP
+#endif
 
 #if OPENSSL_VERSION_NUMBER >= 0x0090800fL
 #ifndef OPENSSL_NO_ECDH
@@ -84,7 +96,20 @@
 
 #ifndef OPENSSL_NO_ECH
 /*#define LIGHTTPD_OPENSSL_ECH_DEBUG*/ /*(ECH developer debug trace)*/
+#if defined(BORINGSSL_API_VERSION)
+#include <openssl/hpke.h>
+#ifndef TLSEXT_TYPE_ech
+#define TLSEXT_TYPE_ech TLSEXT_TYPE_encrypted_client_hello
+#endif
+#ifndef OSSL_ECH_FOR_RETRY
+#define OSSL_ECH_FOR_RETRY 1
+#endif
+#ifndef SSL_ECH_STATUS_SUCCESS
+#define SSL_ECH_STATUS_SUCCESS 1
+#endif
+#else
 #include <openssl/ech.h>
+#endif
 #endif
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
@@ -101,6 +126,10 @@
 #include "log.h"
 #include "plugin.h"
 #include "sock_addr.h"
+
+#ifdef BORINGSSL_API_VERSION
+#include "base64.h"
+#endif
 
 typedef struct mod_openssl_kp {
     EVP_PKEY *ssl_pemfile_pkey;
@@ -275,6 +304,72 @@ handler_ctx_free (handler_ctx *hctx)
 }
 
 
+__attribute_cold__
+__attribute_noinline__
+static void
+elog (log_error_st * const errh, const char * const file, const int line,
+      const char * const msg)
+{
+    /* error logging convenience function which decodes err codes */
+    char buf[256];
+    ERR_error_string_n(ERR_get_error(), buf, sizeof(buf)); /*(thread-safe)*/
+    log_error(errh, file, line, "SSL: %s %s", msg, buf);
+}
+
+
+__attribute_cold__
+__attribute_format__((__printf__, 4, 5))
+__attribute_noinline__
+static void
+elogf (log_error_st * const errh, const char * const file, const int line,
+       const char * const fmt, ...)
+{
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    elog(errh, file, line, msg);
+}
+
+
+__attribute_cold__
+__attribute_noinline__
+static void
+elogc (handler_ctx * const hctx,
+       const char * const file, const int line, const int ssl_err)
+{
+    char buf[256];
+    uint32_t err;
+    while ((err = ERR_get_error())) {
+        switch (ERR_GET_REASON(err)) {
+          case SSL_R_SSL_HANDSHAKE_FAILURE:
+        #ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+          case SSL_R_UNEXPECTED_EOF_WHILE_READING:
+        #endif
+        #ifdef SSL_R_TLSV1_ALERT_UNKNOWN_CA
+          case SSL_R_TLSV1_ALERT_UNKNOWN_CA:
+        #endif
+        #ifdef SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN
+          case SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN:
+        #endif
+        #ifdef SSL_R_SSLV3_ALERT_BAD_CERTIFICATE
+          case SSL_R_SSLV3_ALERT_BAD_CERTIFICATE:
+        #endif
+            if (!hctx->conf.ssl_log_noise) continue;
+            break;
+          default:
+            break;
+        }
+        ERR_error_string_n(err, buf, sizeof(buf)); /*(thread-safe interface)*/
+        log_error(hctx->r->conf.errh, file, line, "SSL: addr:%s ssl_err:%d %s",
+                  hctx->con->dst_addr_buf.ptr, ssl_err, buf);
+    }
+}
+
+
+
+
 static int
 mod_openssl_SSL_CTX_use_cert_and_key (SSL_CTX *ssl_ctx, plugin_cert *pc, mod_openssl_kp *kp)
 {
@@ -283,7 +378,8 @@ mod_openssl_SSL_CTX_use_cert_and_key (SSL_CTX *ssl_ctx, plugin_cert *pc, mod_ope
     UNUSED(pc); /*(used below if openssl < 1.0.2)*/
 
   #if OPENSSL_VERSION_NUMBER >= 0x10101000 \
-   && !defined(LIBRESSL_VERSION_NUMBER)
+   && !defined(LIBRESSL_VERSION_NUMBER) \
+   && !defined(BORINGSSL_API_VERSION)
 
     return SSL_CTX_use_cert_and_key(ssl_ctx,
                                     kp->ssl_pemfile_x509,
@@ -323,7 +419,8 @@ mod_openssl_SSL_use_cert_and_key (SSL *ssl, plugin_cert *pc, mod_openssl_kp *kp)
     UNUSED(pc); /*(used below if openssl < 1.0.2)*/
 
   #if OPENSSL_VERSION_NUMBER >= 0x10101000 \
-   && !defined(LIBRESSL_VERSION_NUMBER)
+   && !defined(LIBRESSL_VERSION_NUMBER) \
+   && !defined(BORINGSSL_API_VERSION)
 
     return SSL_use_cert_and_key(ssl,
                                 kp->ssl_pemfile_x509,
@@ -333,16 +430,13 @@ mod_openssl_SSL_use_cert_and_key (SSL *ssl, plugin_cert *pc, mod_openssl_kp *kp)
 
   #else
 
+    if (1 != SSL_use_certificate(ssl, kp->ssl_pemfile_x509))
+        return 0;
    #if OPENSSL_VERSION_NUMBER >= 0x10002000 \
     && (!defined(LIBRESSL_VERSION_NUMBER) \
         || LIBRESSL_VERSION_NUMBER >= 0x3000000fL)
-    if (1 != SSL_use_certificate(ssl, kp->ssl_pemfile_x509))
-        return 0;
     if (kp->ssl_pemfile_chain)
         SSL_set1_chain(ssl, kp->ssl_pemfile_chain);
-   #else
-    if (1 != SSL_use_certificate_chain_file(ssl, pc->ssl_pemfile->ptr))
-        return 0;
    #endif
 
     if (1 != SSL_use_PrivateKey(ssl, kp->ssl_pemfile_pkey))
@@ -386,6 +480,7 @@ mod_openssl_session_ticket_key_generate (unix_time64_t active_ts, unix_time64_t 
      */
     /*(RAND_priv_bytes() not in openssl 1.1.0; introduced in openssl 1.1.1)*/
   #if OPENSSL_VERSION_NUMBER < 0x10101000L \
+   || defined(BORINGSSL_API_VERSION) \
    || defined(LIBRESSL_VERSION_NUMBER)
   #define RAND_priv_bytes(x,sz) RAND_bytes((x),(sz))
   #endif
@@ -613,6 +708,7 @@ mod_openssl_session_ticket_key_check (const plugin_data *p, const unix_time64_t 
 
 
 #ifndef OPENSSL_NO_OCSP
+#ifndef BORINGSSL_API_VERSION /* BoringSSL suggests using different API */
 static int
 ssl_tlsext_status_cb(SSL *ssl, void *arg)
 {
@@ -629,7 +725,7 @@ ssl_tlsext_status_cb(SSL *ssl, void *arg)
 
     int len = (int)buffer_clen(ssl_stapling);
 
-    /* OpenSSL and LibreSSL require copy */
+    /* OpenSSL and LibreSSL require copy (BoringSSL, too, if using compat API)*/
     uint8_t *ocsp_resp = OPENSSL_malloc(len);
     if (NULL == ocsp_resp)
         return SSL_TLSEXT_ERR_NOACK; /* ignore OCSP request if error occurs */
@@ -640,9 +736,9 @@ ssl_tlsext_status_cb(SSL *ssl, void *arg)
     hctx->kp = NULL;
 
     if (!SSL_set_tlsext_status_ocsp_resp(ssl, ocsp_resp, len)) {
-        log_error(hctx->r->conf.errh, __FILE__, __LINE__,
-          "SSL: failed to set OCSP response for TLS server name %s: %s",
-          hctx->r->uri.authority.ptr, ERR_error_string(ERR_get_error(), NULL));
+        elogf(hctx->r->conf.errh, __FILE__, __LINE__,
+          "failed to set OCSP response for TLS server name %s",
+          hctx->r->uri.authority.ptr);
         OPENSSL_free(ocsp_resp);
         return SSL_TLSEXT_ERR_NOACK; /* ignore OCSP request if error occurs */
         /*return SSL_TLSEXT_ERR_ALERT_FATAL;*/
@@ -650,11 +746,13 @@ ssl_tlsext_status_cb(SSL *ssl, void *arg)
     return SSL_TLSEXT_ERR_OK;
 }
 #endif
+#endif
 
 
 #ifndef OPENSSL_NO_ECH
 
 #ifdef LIGHTTPD_OPENSSL_ECH_DEBUG
+#if !defined(BORINGSSL_API_VERSION)
 static void ech_key_status_trace (server * const srv, OSSL_ECHSTORE * const es)
 {
     int numkeys = 0;
@@ -667,6 +765,7 @@ static void ech_key_status_trace (server * const srv, OSSL_ECHSTORE * const es)
           "SSL: OSSL_ECHSTORE_num_keys number of keys loaded %d",
           numkeys);
 }
+#endif
 #endif
 
 __attribute_pure__
@@ -786,6 +885,123 @@ mod_openssl_refresh_ech_keys_ctx (server * const srv, plugin_ssl_ctx * const s, 
         *v = fallback ? 0 : OSSL_ECH_FOR_RETRY;
     }
 
+  #if defined(BORINGSSL_API_VERSION)
+
+    SSL_ECH_KEYS *keys = SSL_ECH_KEYS_new();
+    if (keys == NULL) {
+        array_free_data(&a);
+        return 0;
+    }
+
+    int rc = 1;
+    for (uint32_t i = 0; i < a.used; ++i) {
+        buffer * const n = &a.sorted[i]->key;
+        buffer_append_path_len(kp, BUF_PTR_LEN(n)); /* *.ech */
+
+        int rv = 0;
+        off_t dlen = 64*1024;/*(arbitrary limit: 64 KB file; expect < 1 KB)*/
+        char *data = fdevent_load_file(kp->ptr, &dlen, srv->errh, malloc, free);
+        EVP_HPKE_KEY key;
+        EVP_HPKE_KEY_zero(&key);
+        buffer * const tb = srv->tmp_buf;
+        buffer_clear(tb);
+        do {
+            if (NULL == data) break;
+
+            char *b, *e;
+            uint32_t len;
+            b = strstr(data, PEM_BEGIN_PKEY);
+            if (NULL == b) break;
+            b += sizeof(PEM_BEGIN_PKEY)-1;
+            if (*b == '\r') ++b;
+            if (*b == '\n') ++b;
+            e = strstr(b, PEM_END_PKEY);
+            if (NULL == e) break;
+            len = (uint32_t)(e - b);
+
+            buffer_clear(tb);
+            if (NULL == buffer_append_base64_decode(tb,b,len,BASE64_STANDARD))
+                break;
+
+            const uint8_t *x = (uint8_t *)tb->ptr;
+            EVP_PKEY *pkey = d2i_AutoPrivateKey(NULL,&x,(long)buffer_clen(tb));
+            /*(BoringSSL tools/bssl outputs raw pkey;
+             * handle if that output is subsequently base64-encoded raw pkey)*/
+            /*if (NULL == pkey) break;*/
+
+            const EVP_HPKE_KEM * const kem = (pkey == NULL)
+              ? EVP_hpke_x25519_hkdf_sha256()
+              : EVP_PKEY_id(pkey) == EVP_PKEY_X25519 /* NID_X25519 */
+              ? EVP_hpke_x25519_hkdf_sha256()
+             #ifndef AWSLC_API_VERSION
+              : EVP_PKEY_id(pkey) == EVP_PKEY_EC /* NID_X9_62_id_ecPublicKey */
+              ? EVP_hpke_p256_hkdf_sha256()
+             #endif
+              : NULL;
+            if (NULL == kem) {
+                EVP_PKEY_free(pkey);
+                break;
+            }
+
+            size_t out_len = buffer_clen(tb); /*(large enough)*/
+            rv = (pkey)
+              ? EVP_PKEY_get_raw_private_key(pkey, (uint8_t *)tb->ptr, &out_len)
+              : 1;
+            EVP_PKEY_free(pkey);
+            if (0 == rv)
+                break;
+            rv = 0;
+
+            EVP_HPKE_KEY_zero(&key);
+            if (!EVP_HPKE_KEY_init(&key, kem, (uint8_t *)tb->ptr, out_len))
+                break;
+
+            ck_memzero(tb->ptr, buffer_clen(tb));
+
+            b = strstr(data, PEM_BEGIN_ECHCONFIG);
+            if (NULL == b) break;
+            b += sizeof(PEM_BEGIN_ECHCONFIG)-1;
+            if (*b == '\r') ++b;
+            if (*b == '\n') ++b;
+            e = strstr(b, PEM_END_ECHCONFIG);
+            if (NULL == e) break;
+            len = (uint32_t)(e - b);
+
+            buffer_clear(tb);
+            if (NULL == buffer_append_base64_decode(tb,b,len,BASE64_STANDARD))
+                break;
+
+            /* OpenSSL tool 'openssl ech' ECHConfig begins with 2-byte len;
+             * BoringSSL 'tool/bssl generate-ech' ECHConfig does not */
+            if (buffer_clen(tb) > 2
+                && (uint32_t)((tb->ptr[0]<<4)|tb->ptr[1]) == buffer_clen(tb)-2){
+                memmove(tb->ptr, tb->ptr+2, buffer_clen(tb)-2);
+                buffer_truncate(tb, buffer_clen(tb)-2);
+            }
+
+            const int is_retry_config = ((data_integer *)a.sorted[i])->value;
+            rv = SSL_ECH_KEYS_add(keys, is_retry_config,
+                                  (uint8_t *)BUF_PTR_LEN(tb), &key);
+        } while (0);
+        ck_memzero(tb->ptr, buffer_clen(tb));
+        EVP_HPKE_KEY_cleanup(&key);
+        if (dlen) ck_memzero(data, dlen);
+        free(data);
+
+        if (0 == rv) {
+            elog(srv->errh, __FILE__, __LINE__, kp->ptr);
+            rc = 0;
+        }
+
+        buffer_truncate(kp, dirlen);
+    }
+
+    if (1 != SSL_CTX_set1_ech_keys(s->ssl_ctx, keys))
+        rc = 0;
+    SSL_ECH_KEYS_free(keys);
+
+  #else  /* !BORINGSSL_API_VERSION */
+
     OSSL_ECHSTORE * const es = OSSL_ECHSTORE_new(NULL, NULL);
     if (es == NULL) {
         array_free_data(&a);
@@ -825,6 +1041,8 @@ mod_openssl_refresh_ech_keys_ctx (server * const srv, plugin_ssl_ctx * const s, 
    #endif
     OSSL_ECHSTORE_free(es);
 
+  #endif /* !BORINGSSL_API_VERSION */
+
     array_free_data(&a);
 
     if (1 == rc) s->ech_keydir_refresh_ts = cur_ts;
@@ -850,6 +1068,7 @@ mod_openssl_refresh_ech_keys (server * const srv, const plugin_data *p, const un
 
 
 #ifdef LIGHTTPD_OPENSSL_ECH_DEBUG
+#if !defined(BORINGSSL_API_VERSION)
 
 __attribute_const__
 static const char * ech_status_str (int status)
@@ -906,6 +1125,7 @@ mod_openssl_ech_cb (SSL * const ssl, const char * const str)
     return 1;
 }
 
+#endif /* !BORING_API_VERSION */
 #endif /* LIGHTTPD_OPENSSL_ECH_DEBUG */
 
 
@@ -981,14 +1201,23 @@ mod_openssl_ech_only_policy_check (request_st * const r, handler_ctx * const hct
     char *sni_ech = NULL;
     char *sni_clr = NULL;
     handler_t rc = HANDLER_GO_ON;
+  #if defined(BORINGSSL_API_VERSION)
+    switch (SSL_ech_accepted(hctx->ssl))
+  #else
     switch (SSL_ech_get1_status(hctx->ssl, &sni_ech, &sni_clr))
+  #endif
     {
       case SSL_ECH_STATUS_SUCCESS:
         /* require that request :authority (Host) match SNI in ECH to avoid one
          * ECH-provided host testing for existence of another ECH-only host.
          * 'sni_ech' is assumed normalized since ECH decryption succeeded. */
        {
+      #if defined(BORINGSSL_API_VERSION)
+        const char *ech =
+          SSL_get_servername(hctx->ssl, TLSEXT_NAMETYPE_host_name);
+      #else
         const char *ech = sni_ech;
+      #endif
         if (mod_openssl_ech_only_host_match(BUF_PTR_LEN(r->http_host),
                                             ech, strlen(ech)))
             break;
@@ -1344,6 +1573,7 @@ PEM_ASN1_read_bio_secmem(d2i_of_void *d2i, const char *name, BIO *bp, void **x,
     char *ret = NULL;
 
   #if OPENSSL_VERSION_NUMBER >= 0x10101000L \
+   && !defined(BORINGSSL_API_VERSION) \
    && !defined(LIBRESSL_VERSION_NUMBER)
     if (!PEM_bytes_read_bio_secmem(&data, &len, NULL, name, bp, cb, u))
   #else
@@ -1352,13 +1582,19 @@ PEM_ASN1_read_bio_secmem(d2i_of_void *d2i, const char *name, BIO *bp, void **x,
         return NULL;
     p = data;
     ret = d2i(x, &p, len);
+  #ifndef BORINGSSL_API_VERSION /* missing PEMerr() macro */
     if (ret == NULL)
       #if OPENSSL_VERSION_NUMBER < 0x30000000L
         PEMerr(PEM_F_PEM_ASN1_READ_BIO, ERR_R_ASN1_LIB);
       #else
         ERR_raise(ERR_LIB_PEM, ERR_R_ASN1_LIB);
       #endif
+  #endif
+    /* boringssl provides OPENSSL_secure_clear_free() in commit
+     * 8a1542fc41b43bdcd67cd341c1d332d2e05e2340 (not yet in a release)
+     * (note: boringssl already calls OPENSSL_cleanse() in OPENSSL_free()) */
   #if OPENSSL_VERSION_NUMBER >= 0x10101000L \
+   && !defined(BORINGSSL_API_VERSION) \
    && !defined(LIBRESSL_VERSION_NUMBER)
     OPENSSL_secure_clear_free(data, len);
   #else
@@ -1486,9 +1722,7 @@ mod_openssl_load_cacrls (X509_STORE *store, const char *ssl_ca_crl_file, server 
     if (1 != X509_STORE_load_locations(store, ssl_ca_crl_file, NULL))
   #endif
     {
-        log_error(srv->errh, __FILE__, __LINE__,
-          "SSL: %s %s", ERR_error_string(ERR_get_error(), NULL),
-          ssl_ca_crl_file);
+        elog(srv->errh, __FILE__, __LINE__, ssl_ca_crl_file);
         return 0;
     }
     X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
@@ -1505,8 +1739,7 @@ mod_openssl_load_verify_locn (SSL_CTX *ssl_ctx, const buffer *b, server *srv)
     if (1 == SSL_CTX_load_verify_locations(ssl_ctx, fn, NULL))
         return 1;
 
-    log_error(srv->errh, __FILE__, __LINE__,
-      "SSL: %s %s", ERR_error_string(ERR_get_error(), NULL), fn);
+    elog(srv->errh, __FILE__, __LINE__, fn);
     return 0;
 }
 
@@ -1737,7 +1970,8 @@ verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
     safer_X509_NAME_oneline(X509_get_subject_name(err_cert),buf,sizeof(buf));
     log_error_st *errh = hctx->r->conf.errh;
     log_error(errh, __FILE__, __LINE__,
-      "SSL: verify error:num=%d:%s:depth=%d:subject=%s",
+      "SSL: addr:%s verify error:num=%d:%s:depth=%d:subject=%s",
+      hctx->con->dst_addr_buf.ptr,
       err, X509_verify_cert_error_string(err), depth, buf);
 
     /*
@@ -1747,7 +1981,8 @@ verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
     if (!preverify_ok && (err == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY ||
                           err == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT)) {
         safer_X509_NAME_oneline(X509_get_issuer_name(err_cert),buf,sizeof(buf));
-        log_error(errh, __FILE__, __LINE__, "SSL: issuer=%s", buf);
+        log_error(errh, __FILE__, __LINE__,
+          "SSL: addr:%s issuer=%s", hctx->con->dst_addr_buf.ptr, buf);
     }
 
     return !hctx->conf.ssl_verifyclient_enforce;
@@ -1794,7 +2029,8 @@ mod_openssl_cert_cb (SSL *ssl, void *arg)
        || LIBRESSL_VERSION_NUMBER >= 0x3000000fL)
     if (hctx->kp->ssl_pemfile_chain) {
     }
-   #if !defined(LIBRESSL_VERSION_NUMBER)
+   #if !defined(BORINGSSL_API_VERSION) \
+    && !defined(LIBRESSL_VERSION_NUMBER)
     /* (missing SSL_set1_chain_cert_store() and SSL_build_cert_chain()) */
     else if (hctx->conf.ssl_ca_file && !hctx->kp->self_issued) {
         /* preserve legacy behavior whereby openssl will reuse CAs trusted for
@@ -1802,10 +2038,9 @@ mod_openssl_cert_cb (SSL *ssl, void *arg)
          * SSL_CTX) in order to build certificate chain for server certificate
          * sent to client */
         if (1 != SSL_use_certificate(ssl, hctx->kp->ssl_pemfile_x509)) {
-            log_error(hctx->r->conf.errh, __FILE__, __LINE__,
-              "SSL: failed to set certificate for TLS server name %s: %s",
-              hctx->r->uri.authority.ptr,
-              ERR_error_string(ERR_get_error(), NULL));
+            elogf(hctx->r->conf.errh, __FILE__, __LINE__,
+              "failed to set certificate for TLS server name %s",
+              hctx->r->uri.authority.ptr);
             return 0;
         }
 
@@ -1815,10 +2050,9 @@ mod_openssl_cert_cb (SSL *ssl, void *arg)
                                         SSL_BUILD_CHAIN_FLAG_NO_ROOT
                                       | SSL_BUILD_CHAIN_FLAG_IGNORE_ERROR
                                       | SSL_BUILD_CHAIN_FLAG_CLEAR_ERROR)) {
-            log_error(hctx->r->conf.errh, __FILE__, __LINE__,
-              "SSL: building cert chain for TLS server name %s: %s",
-              hctx->r->uri.authority.ptr,
-              ERR_error_string(ERR_get_error(), NULL));
+            elogf(hctx->r->conf.errh, __FILE__, __LINE__,
+              "building cert chain for TLS server name %s",
+              hctx->r->uri.authority.ptr);
             return 0;
         }
         else { /* copy chain for future reuse */
@@ -1832,16 +2066,30 @@ mod_openssl_cert_cb (SSL *ssl, void *arg)
   #endif
 
     if (1 != mod_openssl_SSL_use_cert_and_key(ssl, pc, hctx->kp)) {
-        log_error(hctx->r->conf.errh, __FILE__, __LINE__,
-          "SSL: failed to set cert for TLS server name %s: %s",
-          hctx->r->uri.authority.ptr, ERR_error_string(ERR_get_error(), NULL));
+        elogf(hctx->r->conf.errh, __FILE__, __LINE__,
+          "failed to set cert for TLS server name %s",
+          hctx->r->uri.authority.ptr);
         return 0;
     }
   }
 
+  #ifndef OPENSSL_NO_OCSP
+  #ifdef BORINGSSL_API_VERSION
+    /* BoringSSL suggests API different than SSL_CTX_set_tlsext_status_cb() */
+    buffer *ocsp_resp = hctx->kp->ssl_stapling_der;
+    if (NULL != ocsp_resp
+        && !SSL_set_ocsp_response(ssl, (uint8_t *)BUF_PTR_LEN(ocsp_resp))) {
+        elogf(hctx->r->conf.errh, __FILE__, __LINE__,
+          "failed to set OCSP response for TLS server name %s",
+          hctx->r->uri.authority.ptr);
+        return 0;
+    }
+  #endif
+  #endif
+
     /* (openssl library keeps refcnts on its objects) */
     /* retain hctx->kp if needed for OCSP staping response (tlsext_status_cb) */
-  #if !defined(OPENSSL_NO_OCSP)
+  #if !defined(OPENSSL_NO_OCSP) && !defined(BORINGSSL_API_VERSION)
     if (NULL == hctx->kp->ssl_stapling_der)
   #endif
     {
@@ -1887,7 +2135,8 @@ mod_openssl_SNI (handler_ctx *hctx, const char *servername, size_t len)
     request_st * const r = hctx->r;
     if (len >= 1024) { /*(expecting < 256; TLSEXT_MAXLEN_host_name is 255)*/
         log_error(r->conf.errh, __FILE__, __LINE__,
-                  "SSL: SNI name too long %.*s", (int)len, servername);
+          "SSL: addr:%s SNI name too long (%zu) %.*s...",
+          hctx->con->dst_addr_buf.ptr, len, 1024, servername);
         return SSL_TLSEXT_ERR_ALERT_FATAL;
     }
 
@@ -1912,11 +2161,15 @@ mod_openssl_SNI (handler_ctx *hctx, const char *servername, size_t len)
          * to help admins avoid mistakes where ech-only host might be accessed
          * on a different port.  Admin can use separate lighttpd instances if
          * there is a need for such complex behavior on different ports.) */
+      #if defined(BORINGSSL_API_VERSION)
+        int rc = SSL_ech_accepted(hctx->ssl);
+      #else
         char *sni_ech = NULL;
         char *sni_clr = NULL;
         int rc = SSL_ech_get1_status(hctx->ssl, &sni_ech, &sni_clr);
         OPENSSL_free(sni_ech);
         OPENSSL_free(sni_clr);
+      #endif
         switch (rc) {
           case SSL_ECH_STATUS_SUCCESS:
             break;
@@ -2028,12 +2281,14 @@ network_ssl_servername_callback (SSL *ssl, int *al, void *srv)
 
 #if OPENSSL_VERSION_NUMBER < 0x10101000L \
  || !(defined(_LP64) || defined(__LP64__) || defined(_WIN64)) \
+ || defined(BORINGSSL_API_VERSION) \
  ||(defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x3060000fL)
 static unix_time64_t
 mod_openssl_asn1_time_to_posix (const ASN1_TIME *asn1time);
 #endif
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L \
+ && !defined(BORINGSSL_API_VERSION) \
  && !defined(LIBRESSL_VERSION_NUMBER)
 #define X509_get0_notBefore X509_get_notBefore
 #define X509_get0_notAfter  X509_get_notAfter
@@ -2046,6 +2301,7 @@ mod_openssl_cert_is_active (const X509 *crt)
     const ASN1_TIME *notAfter  = X509_get0_notAfter(crt);
   #if OPENSSL_VERSION_NUMBER < 0x10101000L \
    || !(defined(_LP64) || defined(__LP64__) || defined(_WIN64)) \
+   || defined(BORINGSSL_API_VERSION) \
    ||(defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x3060000fL)
     const unix_time64_t before = mod_openssl_asn1_time_to_posix(notBefore);
     const unix_time64_t after  = mod_openssl_asn1_time_to_posix(notAfter);
@@ -2145,6 +2401,11 @@ mod_openssl_reload_crl_file (server *srv, plugin_cacerts *cacerts, const unix_ti
   #endif
 
     /* CRLs can be updated at any time, though expected on/before Next Update */
+    /* For BoringSSL, SSL_CTX_set_cert_store() is called in network_init_ssl()
+     * to support auto-chaining.  Since only CRLs are updated here, there are
+     * no modifications needed there; the SSL_CTX will keep reference to
+     * original ref-counted X509_STORE for cert auto-chaining.  (Or, we could
+     * add code to resolve all certificate chains at startup.) */
     X509_STORE * const new_store = X509_STORE_new();
     if (NULL == new_store)
         return 0;
@@ -2220,6 +2481,7 @@ mod_openssl_load_stapling_file (const char *file, log_error_st *errh, buffer *b)
      *
      * Note: for some TLS libs, the OCSP stapling response is not copied when
      * assigned to a session (and is reasonable since not changed frequently)
+     * - BoringSSL SSL_set_ocsp_response()
      * - WolfSSL SSL_set_tlsext_status_ocsp_resp() (differs from OpenSSL API)
      * Therefore, there is a potential race condition if the OCSP response is
      * assigned to the session during the handshake and the Server Hello is
@@ -2236,6 +2498,19 @@ mod_openssl_load_stapling_file (const char *file, log_error_st *errh, buffer *b)
     char *data = fdevent_load_file(file, &dlen, errh, malloc, free);
     if (NULL == data) return NULL;
 
+  #if defined(BORINGSSL_API_VERSION)
+
+    if (NULL == b)
+        b = buffer_init();
+    else if (b->ptr)
+        free(b->ptr);
+    b->ptr  = data;
+    b->used = (uint32_t)dlen;
+    b->size = (uint32_t)dlen+1;
+    return b;
+
+  #else
+
     BIO *in = BIO_new_mem_buf(data, (int)dlen);
     if (NULL == in) {
         log_error(errh, __FILE__, __LINE__,
@@ -2248,9 +2523,8 @@ mod_openssl_load_stapling_file (const char *file, log_error_st *errh, buffer *b)
     BIO_free(in);
     free(data);
     if (NULL == x) {
-        log_error(errh, __FILE__, __LINE__,
-          "SSL: OCSP stapling file read error: %s %s",
-          ERR_error_string(ERR_get_error(), NULL), file);
+        elogf(errh, __FILE__, __LINE__,
+          "OCSP stapling file read error: %s", file);
         return NULL;
     }
 
@@ -2265,6 +2539,8 @@ mod_openssl_load_stapling_file (const char *file, log_error_st *errh, buffer *b)
     OPENSSL_free(rspder);
     OCSP_RESPONSE_free(x);
     return rspderlen ? b : NULL;
+
+  #endif
 }
 
 #endif /* OPENSSL_NO_OCSP */
@@ -2273,7 +2549,12 @@ mod_openssl_load_stapling_file (const char *file, log_error_st *errh, buffer *b)
 static unix_time64_t
 mod_openssl_asn1_time_to_posix (const ASN1_TIME *asn1time)
 {
-  #if defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER>=0x2050100fL
+  #if defined(BORINGSSL_API_VERSION) && BORINGSSL_API_VERSION >= 19
+
+    int64_t t;
+    return ASN1_TIME_to_posix(asn1time, &t) ? (unix_time64_t)t : -1;
+
+  #elif defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER>=0x2050100fL
 
     struct tm x;
    #if LIBRESSL_VERSION_NUMBER >= 0x3050000fL
@@ -2286,7 +2567,10 @@ mod_openssl_asn1_time_to_posix (const ASN1_TIME *asn1time)
     time_t t = timegm(&x);
     return (t != (time_t)-1) ? TIME64_CAST(t) : t;
 
-  #elif defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER <0x3050000fL
+  #elif (defined(LIBRESSL_VERSION_NUMBER) \
+         && LIBRESSL_VERSION_NUMBER < 0x3050000fL) \
+     || (!defined(LIBRESSL_VERSION_NUMBER) \
+         && OPENSSL_VERSION_NUMBER < 0x10002000L)
     /* LibreSSL was forked from OpenSSL 1.0.1; does not have ASN1_TIME_diff */
 
     /*(Note: all certificate times are expected to use UTC)*/
@@ -2359,7 +2643,7 @@ mod_openssl_asn1_time_to_posix (const ASN1_TIME *asn1time)
 
   #else
 
-   #if OPENSSL_VERSION_NUMBER >= 0x10101000L
+   #if OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined(BORINGSSL_API_VERSION)
 
     struct tm x;
     if (!ASN1_TIME_to_tm(asn1time, &x))
@@ -2386,6 +2670,10 @@ mod_openssl_asn1_time_to_posix (const ASN1_TIME *asn1time)
 static unix_time64_t
 mod_openssl_ocsp_next_update (buffer *der)
 {
+  #if defined(BORINGSSL_API_VERSION)
+    UNUSED(der);
+    return -1; /*(not implemented)*/
+  #else
     const unsigned char *p = (unsigned char *)der->ptr; /*(p gets modified)*/
     OCSP_RESPONSE *ocsp = d2i_OCSP_RESPONSE(NULL, &p, buffer_clen(der));
     if (NULL == ocsp) return -1;
@@ -2410,6 +2698,7 @@ mod_openssl_ocsp_next_update (buffer *der)
     OCSP_RESPONSE_free(ocsp);
 
     return t;
+  #endif
 }
 
 
@@ -2446,7 +2735,7 @@ mod_openssl_reload_stapling_file (server *srv, plugin_cert *pc, const unix_time6
     if (kp->ssl_stapling_nextts == (time_t)-1) {
         /* "Next Update" might not be provided by OCSP responder
          * Use 3600 sec (1 hour) in that case. */
-        /* Trigger reload in 1 hour if unable to determine Next Update */
+        /* retry in 1 hour if unable to determine Next Update */
         kp->ssl_stapling_nextts = cur_ts + 3600;
         kp->ssl_stapling_loadts = 0;
     }
@@ -2500,8 +2789,9 @@ static int
 mod_openssl_crt_must_staple (const X509 *crt)
 {
   #if OPENSSL_VERSION_NUMBER < 0x10100000L \
+   || defined(BORINGSSL_API_VERSION) \
    || defined(LIBRESSL_VERSION_NUMBER)
-    /*(not currently supported in LibreSSL)*/
+    /*(not currently supported in BoringSSL or LibreSSL)*/
     UNUSED(crt);
     return 0;
   #else
@@ -2535,23 +2825,23 @@ network_openssl_load_pemfile (server *srv, const buffer *pemfile, const buffer *
 {
     if (!mod_openssl_init_once_openssl(srv)) return NULL;
 
-    EVP_PKEY *ssl_pemfile_pkey =
-      mod_openssl_evp_pkey_load_pem_file(privkey->ptr, srv->errh);
-    if (NULL == ssl_pemfile_pkey)
-        return NULL;
-
     STACK_OF(X509) *ssl_pemfile_chain = NULL;
     X509 *ssl_pemfile_x509 =
       mod_openssl_load_pem_file(pemfile->ptr, srv->errh, &ssl_pemfile_chain);
-    if (NULL == ssl_pemfile_x509) {
-        EVP_PKEY_free(ssl_pemfile_pkey);
+    if (NULL == ssl_pemfile_x509)
+        return NULL;
+
+    EVP_PKEY *ssl_pemfile_pkey =
+      mod_openssl_evp_pkey_load_pem_file(privkey->ptr, srv->errh);
+    if (NULL == ssl_pemfile_pkey) {
+        X509_free(ssl_pemfile_x509);
+        sk_X509_pop_free(ssl_pemfile_chain, X509_free);
         return NULL;
     }
 
     if (!X509_check_private_key(ssl_pemfile_x509, ssl_pemfile_pkey)) {
-        log_error(srv->errh, __FILE__, __LINE__, "SSL:"
-          "Private key does not match the certificate public key, "
-          "reason: %s %s %s", ERR_error_string(ERR_get_error(), NULL),
+        elogf(srv->errh, __FILE__, __LINE__, "SSL:"
+          "Private key does not match the certificate public key %s %s",
           pemfile->ptr, privkey->ptr);
         EVP_PKEY_free(ssl_pemfile_pkey);
         X509_free(ssl_pemfile_x509);
@@ -2638,15 +2928,6 @@ mod_openssl_acme_tls_1 (SSL *ssl, handler_ctx *hctx)
     len = buffer_clen(b);
 
     do {
-        buffer_append_string_len(b, CONST_STR_LEN(".key.pem"));
-        ssl_pemfile_pkey = mod_openssl_evp_pkey_load_pem_file(b->ptr, errh);
-        if (NULL == ssl_pemfile_pkey) {
-            log_error(errh, __FILE__, __LINE__,
-              "SSL: Failed to load acme-tls/1 pemfile: %s", b->ptr);
-            break;
-        }
-
-        buffer_truncate(b, len); /*(remove ".key.pem")*/
         buffer_append_string_len(b, CONST_STR_LEN(".crt.pem"));
         ssl_pemfile_x509 =
           mod_openssl_load_pem_file(b->ptr, errh, &ssl_pemfile_chain);
@@ -2656,12 +2937,30 @@ mod_openssl_acme_tls_1 (SSL *ssl, handler_ctx *hctx)
             break;
         }
 
+        buffer_truncate(b, len); /*(remove ".crt.pem")*/
+        buffer_append_string_len(b, CONST_STR_LEN(".key.pem"));
+        ssl_pemfile_pkey = mod_openssl_evp_pkey_load_pem_file(b->ptr, errh);
+        if (NULL == ssl_pemfile_pkey) {
+            log_error(errh, __FILE__, __LINE__,
+              "SSL: Failed to load acme-tls/1 pemfile: %s", b->ptr);
+            break;
+        }
+
+      #if 0 /* redundant with below? */
+        if (!X509_check_private_key(ssl_pemfile_x509, ssl_pemfile_pkey)) {
+            elogf(errh, __FILE__, __LINE__,
+               "Private key does not match acme-tls/1 "
+               "certificate public key %s", b->ptr);
+            break;
+        }
+      #endif
+
         /* first set certificate!
          * setting private key checks whether certificate matches it */
         if (1 != SSL_use_certificate(ssl, ssl_pemfile_x509)) {
-            log_error(errh, __FILE__, __LINE__,
-              "SSL: failed to set acme-tls/1 certificate for TLS server "
-              "name %s: %s", name->ptr, ERR_error_string(ERR_get_error(),NULL));
+            elogf(errh, __FILE__, __LINE__,
+              "failed to set acme-tls/1 certificate for TLS server name %s",
+              name->ptr);
             break;
         }
 
@@ -2671,9 +2970,9 @@ mod_openssl_acme_tls_1 (SSL *ssl, handler_ctx *hctx)
         }
 
         if (1 != SSL_use_PrivateKey(ssl, ssl_pemfile_pkey)) {
-            log_error(errh, __FILE__, __LINE__,
-              "SSL: failed to set acme-tls/1 private key for TLS server "
-              "name %s: %s", name->ptr, ERR_error_string(ERR_get_error(),NULL));
+            elogf(errh, __FILE__, __LINE__,
+              "failed to set acme-tls/1 private key for TLS server name %s",
+              name->ptr);
             break;
         }
 
@@ -2698,13 +2997,15 @@ mod_openssl_alpn_h2_policy (handler_ctx * const hctx)
   #if 0 /* SNI omitted by client when connecting to IP instead of to name */
     if (buffer_is_blank(&hctx->r->uri.authority)) {
         log_error(hctx->errh, __FILE__, __LINE__,
-          "SSL: error ALPN h2 without SNI");
+          "SSL: addr:%s error ALPN h2 without SNI",
+          hctx->con->dst_addr_buf.ptr);
         return -1;
     }
   #endif
     if (SSL_version(hctx->ssl) < TLS1_2_VERSION) {
         log_error(hctx->errh, __FILE__, __LINE__,
-          "SSL: error ALPN h2 requires TLSv1.2 or later");
+          "SSL: addr:%s error ALPN h2 requires TLSv1.2 or later",
+          hctx->con->dst_addr_buf.ptr);
         return -1;
     }
 
@@ -2780,7 +3081,8 @@ mod_openssl_alpn_select_cb (SSL *ssl, const unsigned char **out, unsigned char *
 #endif /* OPENSSL_NO_TLSEXT */
 
 
-#if defined(LIBRESSL_VERSION_NUMBER)
+#if defined(BORINGSSL_API_VERSION) \
+ || defined(LIBRESSL_VERSION_NUMBER)
 static int
 mod_openssl_ssl_conf_cmd (server *srv, plugin_config_socket *s);
 #endif
@@ -2830,25 +3132,23 @@ network_openssl_ssl_conf_cmd (server *srv, plugin_config_socket *s)
       #endif
         ERR_clear_error();
         if (SSL_CONF_cmd(cctx, ds->key.ptr, ds->value.ptr) <= 0) {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: SSL_CONF_cmd %s %s: %s", ds->key.ptr, ds->value.ptr,
-              ERR_error_string(ERR_get_error(), NULL));
+            elogf(srv->errh, __FILE__, __LINE__,
+              "SSL_CONF_cmd %s %s", ds->key.ptr, ds->value.ptr);
             rc = -1;
             break;
         }
     }
 
     if (0 == rc && 1 != SSL_CONF_CTX_finish(cctx)) {
-        log_error(srv->errh, __FILE__, __LINE__,
-          "SSL: SSL_CONF_CTX_finish(): %s",
-          ERR_error_string(ERR_get_error(), NULL));
+        elog(srv->errh, __FILE__, __LINE__, "SSL_CONF_CTX_finish()");
         rc = -1;
     }
 
     SSL_CONF_CTX_free(cctx);
     return rc;
 
-  #elif defined(LIBRESSL_VERSION_NUMBER)
+  #elif defined(BORINGSSL_API_VERSION) \
+     || defined(LIBRESSL_VERSION_NUMBER)
 
     return mod_openssl_ssl_conf_cmd(srv, s);
 
@@ -2865,6 +3165,7 @@ network_openssl_ssl_conf_cmd (server *srv, plugin_config_socket *s)
 
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
 #ifndef OPENSSL_NO_DH
+#if !defined(BORINGSSL_API_VERSION) && !defined(AWSLC_API_VERSION)
 #if OPENSSL_VERSION_NUMBER < 0x10100000L \
  || (defined(LIBRESSL_VERSION_NUMBER) \
      && LIBRESSL_VERSION_NUMBER < 0x2070000fL)
@@ -2925,6 +3226,7 @@ static DH *get_dh2048(void)
     }
     return dh;
 }
+#endif /* !BORINGSSL_API_VERSION && !AWSLC_API_VERSION */
 #endif /* !OPENSSL_NO_DH */
 #endif /* OPENSSL_VERSION_NUMBER < 0x30000000L */
 
@@ -2938,6 +3240,13 @@ mod_openssl_ssl_conf_dhparameters(server *srv, plugin_config_socket *s, const bu
         log_error(srv->errh, __FILE__, __LINE__,
           "SSL: openssl compiled without DH support, "
           "can't load parameters from %s", dhparameters->ptr);
+    }
+  #elif defined(BORINGSSL_API_VERSION) || defined(AWSLC_API_VERSION)
+    if (dhparameters) {
+        UNUSED(s);
+        log_error(srv->errh, __FILE__, __LINE__,
+          "SSL: BoringSSL/AWS-LC does not support FFDH cipher suites; "
+          "skipping loading parameters from %s", dhparameters->ptr);
     }
   #else
    #if OPENSSL_VERSION_NUMBER < 0x30000000L
@@ -3015,8 +3324,14 @@ mod_openssl_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *
 {
   #if OPENSSL_VERSION_NUMBER >= 0x0090800fL
   #ifndef OPENSSL_NO_ECDH
-  #if (defined(LIBRESSL_VERSION_NUMBER) \
+  #if defined(BORINGSSL_API_VERSION) \
+   || (defined(LIBRESSL_VERSION_NUMBER) \
        && LIBRESSL_VERSION_NUMBER >= 0x2050100fL)
+    /* boringssl eccurves_default[] (now kDefaultGroups[])
+     * has been the equivalent of "X25519:secp256r1:secp384r1" since 2016
+     * (previously with secp521r1 appended for Android)
+     * (and before that the equivalent of "secp256r1:secp384r1:secp521r1"
+     *  since mid 2014) */
     /* libressl eccurves_default[] (now ecgroups_server_default[])
      * has been the equivalent of "X25519:secp256r1:secp384r1"
      * since libressl v2.5.1 (Feb 2017) which added SSL_CTX_set1_groups_list()*/
@@ -3024,25 +3339,32 @@ mod_openssl_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *
         return 1;
   #endif
 
-  #if (defined(LIBRESSL_VERSION_NUMBER) \
+  #if (defined(BORINGSSL_API_VERSION) && BORINGSSL_API_VERSION >= 3) \
+   || (defined(LIBRESSL_VERSION_NUMBER) \
        && LIBRESSL_VERSION_NUMBER >= 0x2050100fL) \
    || OPENSSL_VERSION_NUMBER >= 0x10100000L
     const char *groups = ssl_ec_curve && !buffer_is_blank(ssl_ec_curve)
       ? ssl_ec_curve->ptr
       :
-       #if defined(LIBRESSL_VERSION_NUMBER)
+       #if defined(BORINGSSL_API_VERSION) || defined(LIBRESSL_VERSION_NUMBER)
         /* libressl recognizes X448, but does not appear to implement X448 */
+        /* boringssl include/openssl/evp.h contains comment:
+         * > EVP_PKEY_X448 is defined for OpenSSL compatibility, but we do not
+         * > support X448 and attempts to create keys will fail.
+         */
         "X25519:P-256:P-384";
        #else
         /* openssl recognizes and implements X448 */
         "X25519:P-256:P-384:X448";
        #endif
 
-   #if (defined(LIBRESSL_VERSION_NUMBER) \
+   #if (defined(BORINGSSL_API_VERSION) && BORINGSSL_API_VERSION >= 19) \
+    || (defined(LIBRESSL_VERSION_NUMBER) \
         && LIBRESSL_VERSION_NUMBER >= 0x2050100fL) \
     || OPENSSL_VERSION_NUMBER >= 0x10101000L
     int rc = SSL_CTX_set1_groups_list(s->ssl_ctx, groups);
-   #elif OPENSSL_VERSION_NUMBER >= 0x10100000L
+   #elif (defined(BORINGSSL_API_VERSION) && BORINGSSL_API_VERSION >= 3) \
+      || OPENSSL_VERSION_NUMBER >= 0x10100000L
     int rc = SSL_CTX_set1_curves_list(s->ssl_ctx, groups);
    #endif
     if (1 != rc) {
@@ -3123,6 +3445,8 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
       #endif
       #if OPENSSL_VERSION_NUMBER >= 0x30000000L
         uint64_t ssloptions =
+      #elif defined(BORINGSSL_API_VERSION)
+        uint32_t ssloptions =
       #else
         long ssloptions =
       #endif
@@ -3136,8 +3460,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
         s->ssl_ctx = SSL_CTX_new(SSLv23_server_method());
       #endif
         if (NULL == s->ssl_ctx) {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+            elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_new");
             return -1;
         }
 
@@ -3156,9 +3479,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
          * required for client cert verification to work with sessions */
         if (0 == SSL_CTX_set_session_id_context(
                    s->ssl_ctx,(const unsigned char*)CONST_STR_LEN("lighttpd"))){
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: failed to set session context: %s",
-              ERR_error_string(ERR_get_error(), NULL));
+            elog(srv->errh,__FILE__,__LINE__,"SSL_CTX_set_session_id_context");
             return -1;
         }
 
@@ -3179,8 +3500,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
             if ((SSL_OP_NO_SSLv2
                  & SSL_CTX_set_options(s->ssl_ctx, SSL_OP_NO_SSLv2))
                 != SSL_OP_NO_SSLv2) {
-                log_error(srv->errh, __FILE__, __LINE__,
-                  "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+                elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_set_options");
                 return -1;
             }
         }
@@ -3190,8 +3510,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
             if ((SSL_OP_NO_SSLv3
                  & SSL_CTX_set_options(s->ssl_ctx, SSL_OP_NO_SSLv3))
                 != SSL_OP_NO_SSLv3) {
-                log_error(srv->errh, __FILE__, __LINE__,
-                  "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+                elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_set_options");
                 return -1;
             }
         }
@@ -3199,8 +3518,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
         if (s->ssl_cipher_list) {
             /* Disable support for low encryption ciphers */
             if (SSL_CTX_set_cipher_list(s->ssl_ctx,s->ssl_cipher_list->ptr)!=1){
-                log_error(srv->errh, __FILE__, __LINE__,
-                  "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+                elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_set_cipher_list");
                 return -1;
             }
 
@@ -3230,7 +3548,9 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
       #endif
 
       #ifndef OPENSSL_NO_OCSP
+      #ifndef BORINGSSL_API_VERSION /* BoringSSL suggests using different API */
         SSL_CTX_set_tlsext_status_cb(s->ssl_ctx, ssl_tlsext_status_cb);
+      #endif
       #endif
 
       #if OPENSSL_VERSION_NUMBER >= 0x10002000 \
@@ -3238,6 +3558,16 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
 
         SSL_CTX_set_cert_cb(s->ssl_ctx, mod_openssl_cert_cb, NULL);
         UNUSED(p);
+
+       #if defined(BORINGSSL_API_VERSION) /* BoringSSL limitation */
+        /* set cert store for auto-chaining
+         * BoringSSL does not support SSL_set1_chain_cert_store() in cert_cb */
+        if (s->ssl_ca_file && s->ssl_ca_file->store) {
+            if (!X509_STORE_up_ref(s->ssl_ca_file->store))
+                return -1;
+            SSL_CTX_set_cert_store(s->ssl_ctx, s->ssl_ca_file->store);
+        }
+       #endif
 
       #else /* OPENSSL_VERSION_NUMBER < 0x10002000 */
 
@@ -3279,14 +3609,17 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
 
         if (1 != mod_openssl_SSL_CTX_use_cert_and_key(s->ssl_ctx,
                                                       s->pc, s->pc->kp)) {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: %s %s %s", ERR_error_string(ERR_get_error(), NULL),
+            elogf(srv->errh, __FILE__, __LINE__, "%s %s",
               s->pc->ssl_pemfile->ptr, s->pc->ssl_privkey->ptr);
             return -1;
         }
 
       #endif /* OPENSSL_VERSION_NUMBER < 0x10002000 */
 
+       #if defined(BORINGSSL_API_VERSION)
+       #define SSL_CTX_set_default_read_ahead(ctx,m) \
+               SSL_CTX_set_read_ahead(ctx,m)
+       #endif
         SSL_CTX_set_default_read_ahead(s->ssl_ctx, s->ssl_read_ahead);
         SSL_CTX_set_mode(s->ssl_ctx, SSL_CTX_get_mode(s->ssl_ctx)
                                    | SSL_MODE_ENABLE_PARTIAL_WRITE
@@ -3313,6 +3646,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
       #endif
 
       #if OPENSSL_VERSION_NUMBER >= 0x10100000L \
+       || defined(BORINGSSL_API_VERSION) \
        || defined(LIBRESSL_VERSION_NUMBER)
        #ifdef TLS1_3_VERSION
         if (!SSL_CTX_set_min_proto_version(s->ssl_ctx, TLS1_3_VERSION))
@@ -3325,7 +3659,9 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
       #ifndef OPENSSL_NO_ECH
         if (s->ech_opts) {
           #if defined(LIGHTTPD_OPENSSL_ECH_DEBUG)
+          #if !defined(BORINGSSL_API_VERSION)
             SSL_CTX_ech_set_callback(s->ssl_ctx, mod_openssl_ech_cb);
+          #endif
           #endif
           #if defined(SSL_OP_ECH_TRIALDECRYPT)
             /* enable SSL_OP_ECH_TRIALDECRYPT by default unless disabled;
@@ -3746,9 +4082,7 @@ SETDEFAULTS_FUNC(mod_openssl_set_defaults)
                     cacerts = (plugin_cacerts *)cpv->v.v;
                 }
                 else {
-                    log_error(srv->errh, __FILE__, __LINE__, "SSL: %s %s",
-                      ERR_error_string(ERR_get_error(), NULL),
-                      ssl_ca_file->ptr);
+                    elog(srv->errh, __FILE__, __LINE__, ssl_ca_file->ptr);
                     return HANDLER_ERROR;
                 }
                 break;
@@ -3764,9 +4098,7 @@ SETDEFAULTS_FUNC(mod_openssl_set_defaults)
                     cpv->vtype = T_CONFIG_LOCAL;
                 }
                 else {
-                    log_error(srv->errh, __FILE__, __LINE__, "SSL: %s %s",
-                      ERR_error_string(ERR_get_error(), NULL),
-                      ssl_ca_dn_file->ptr);
+                    elog(srv->errh, __FILE__, __LINE__, ssl_ca_dn_file->ptr);
                     return HANDLER_ERROR;
                 }
                 break;
@@ -3929,10 +4261,17 @@ SETDEFAULTS_FUNC(mod_openssl_set_defaults)
     }
 
   #if OPENSSL_VERSION_NUMBER < 0x30000000L \
+   && !defined(BORINGSSL_API_VERSION) \
    && !defined(LIBRESSL_VERSION_NUMBER)
+  if (log_epoch_secs >= 1792728000) /* 23 Oct 2026 */
     log_error(srv->errh, __FILE__, __LINE__, "SSL:"
       "openssl library version is outdated and has reached end-of-life.  "
-      "As of 11 Sep 2023, only openssl 3.0.0 and later continue to receive "
+      "As of 22 Oct 2026, only openssl 3.5 and later continue to receive "
+      "security patches from openssl.org");
+  else
+    log_error(srv->errh, __FILE__, __LINE__, "SSL:"
+      "openssl library version is outdated and has reached end-of-life.  "
+      "As of 11 Sep 2023, only openssl 3.0 and later continue to receive "
       "security patches from openssl.org");
   #endif
 
@@ -3947,32 +4286,31 @@ SETDEFAULTS_FUNC(mod_openssl_set_defaults)
 }
 
 
+static void
+mod_openssl_detach(handler_ctx *hctx);
+
+
 __attribute_cold__
 static int
-mod_openssl_write_err (SSL * const ssl, int wr, connection * const con,
-                       log_error_st * const errh)
+mod_openssl_write_err (handler_ctx * const restrict hctx, int wr)
 {
-    int ssl_r;
-    unsigned long err;
-
-    switch ((ssl_r = SSL_get_error(ssl, wr))) {
+    /* Note: caller calls ERR_clear_error() before SSL_write() */
+    const int ssl_err = SSL_get_error(hctx->ssl, wr);
+    switch (ssl_err) {
       case SSL_ERROR_WANT_READ:
-        con->is_readable = -1;
+        hctx->con->is_readable = -1;
         return 0; /* try again later */
       case SSL_ERROR_WANT_WRITE:
-        con->is_writable = -1;
+        hctx->con->is_writable = -1;
         return 0; /* try again later */
+      case SSL_ERROR_ZERO_RETURN:
+        /* clean shutdown on the remote side */
+        if (wr == 0) return -2;
+        __attribute_fallthrough__
       case SSL_ERROR_SYSCALL:
-        /* perhaps we have error waiting in our error-queue */
-        if (0 != (err = ERR_get_error())) {
-            do {
-                log_error(errh, __FILE__, __LINE__,
-                  "SSL: %d %d %s",ssl_r,wr,ERR_error_string(err,NULL));
-            } while ((err = ERR_get_error()));
-        }
-        else if (wr == -1) {
-            /* no, but we have errno */
-            switch (errno) {
+        {
+            int errnum = errno;
+            switch (errnum) {
               case EAGAIN:
              #ifdef EWOULDBLOCK
              #if EWOULDBLOCK != EAGAIN
@@ -3986,32 +4324,29 @@ mod_openssl_write_err (SSL * const ssl, int wr, connection * const con,
                 return 0; /* try again later */
               case EPIPE:
               case ECONNRESET:
+               #if 0
+                if (hctx->conf.ssl_log_noise)
+                    log_perror(hctx->errh, __FILE__, __LINE__,
+                      "SSL: addr:%s ssl_err:%d errno:%d",
+                      hctx->con->dst_addr_buf.ptr, ssl_err, errnum);
+               #endif
+                mod_openssl_detach(hctx); /*non-recoverable; skip CLOSE_NOTIFY*/
                 return -2;
               default:
-                log_perror(errh, __FILE__, __LINE__,
-                  "SSL: %d %d", ssl_r, wr);
+                if (0 == ERR_peek_error())
+                    log_perror(hctx->errh, __FILE__, __LINE__,
+                      "SSL: addr:%s ssl_err:%d wr:%d errno:%d",
+                      hctx->con->dst_addr_buf.ptr, ssl_err, wr, errnum);
                 break;
             }
         }
-        else {
-            /* neither error-queue nor errno ? */
-            log_perror(errh, __FILE__, __LINE__,
-              "SSL (error): %d %d", ssl_r, wr);
-        }
         break;
-
-      case SSL_ERROR_ZERO_RETURN:
-        /* clean shutdown on the remote side */
-        if (wr == 0) return -2;
-
-        __attribute_fallthrough__
       default:
-        while ((err = ERR_get_error()))
-            log_error(errh, __FILE__, __LINE__,
-              "SSL: %d %d %s", ssl_r, wr, ERR_error_string(err, NULL));
         break;
     }
 
+    elogc(hctx, __FILE__, __LINE__, ssl_err);
+    mod_openssl_detach(hctx); /* non-recoverable; skip CLOSE_NOTIFY */
     return -1;
 }
 
@@ -4040,8 +4375,6 @@ static int
 connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t max_bytes)
 {
     handler_ctx * const hctx = con->plugin_ctx[plugin_data_singleton->id];
-    SSL * const ssl = hctx->ssl;
-    log_error_st * const errh = hctx->errh;
 
     if (__builtin_expect( (0 != hctx->close_notify), 0))
         return mod_openssl_close_notify(hctx);
@@ -4053,7 +4386,8 @@ connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t ma
           : (uint32_t)max_bytes;
         int wr;
 
-        if (0 != chunkqueue_peek_data(cq, &data, &data_len, errh, 1)) return -1;
+        if (0 != chunkqueue_peek_data(cq, &data, &data_len, hctx->errh, 1))
+            return -1;
         if (__builtin_expect( (0 == data_len), 0)) {
             if (!cq->first->file.busy)
                 chunkqueue_remove_finished_chunks(cq);
@@ -4070,16 +4404,17 @@ connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t ma
          */
 
         ERR_clear_error();
-        wr = SSL_write(ssl, data, data_len);
+        wr = SSL_write(hctx->ssl, data, data_len);
 
         if (__builtin_expect( (hctx->renegotiations > 1), 0)) {
-            log_error(errh, __FILE__, __LINE__,
-              "SSL: renegotiation initiated by client, killing connection");
+            log_error(hctx->errh, __FILE__, __LINE__,
+              "SSL: addr:%s renegotiation initiated by client, "
+              "killing connection", con->dst_addr_buf.ptr);
             return -1;
         }
 
         if (wr <= 0)
-            return mod_openssl_write_err(ssl, wr, con, errh);
+            return mod_openssl_write_err(hctx, wr);
 
         chunkqueue_mark_written(cq, wr);
 
@@ -4130,7 +4465,18 @@ connection_write_cq_ssl_ktls (connection * const con, chunkqueue * const cq, off
           SSL_sendfile(hctx->ssl, c->file.fd, c->offset, (size_t)len, flags);
         if (wr < 0) {
             c->file.busy = (errno == EBUSY);
-            return mod_openssl_write_err(hctx->ssl, (int)wr, con, hctx->errh);
+          #if OPENSSL_VERSION_NUMBER < 0x30400000L /* && >= 0x30000000L */
+            unsigned long err = ERR_peek_error();
+            if (err && ERR_GET_LIB(err) != ERR_LIB_SYS
+                && ERR_GET_REASON(err) == SSL_R_UNINITIALIZED) {
+                int errnum = errno;
+                if (errnum) {
+                    err = ERR_get_error(); /* pop (invalid) error from queue */
+                    ERR_raise_data(ERR_LIB_SYS,errnum,"ktls_sendfile failure");
+                }
+            }
+          #endif
+            return mod_openssl_write_err(hctx, (int)wr);
         }
         c->file.busy = 0;
 
@@ -4138,8 +4484,20 @@ connection_write_cq_ssl_ktls (connection * const con, chunkqueue * const cq, off
 
         ossl_ssize_t wr =
           SSL_sendfile(hctx->ssl, c->file.fd, c->offset, (size_t)len, 0);
-        if (wr < 0)
-            return mod_openssl_write_err(hctx->ssl, (int)wr, con, hctx->errh);
+        if (wr < 0) {
+          #if OPENSSL_VERSION_NUMBER < 0x30400000L /* && >= 0x30000000L */
+            unsigned long err = ERR_peek_error();
+            if (err && ERR_GET_LIB(err) != ERR_LIB_SYS
+                && ERR_GET_REASON(err) == SSL_R_UNINITIALIZED) {
+                int errnum = errno;
+                if (errnum) {
+                    err = ERR_get_error(); /* pop (invalid) error from queue */
+                    ERR_raise_data(ERR_LIB_SYS,errnum,"ktls_sendfile failure");
+                }
+            }
+          #endif
+            return mod_openssl_write_err(hctx, (int)wr);
+        }
 
       #endif
 
@@ -4179,8 +4537,8 @@ connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max
 
         if (hctx->renegotiations > 1) {
             log_error(hctx->errh, __FILE__, __LINE__,
-              "SSL: renegotiation initiated by client, killing connection (%s)",
-              con->dst_addr_buf.ptr);
+              "SSL: addr:%s renegotiation initiated by client, "
+              "killing connection", con->dst_addr_buf.ptr);
             return -1;
         }
 
@@ -4218,9 +4576,8 @@ connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max
              && (hctx->conf.ssl_read_ahead || SSL_pending(hctx->ssl) > 0));
 
     if (len < 0) {
-        int oerrno = errno;
-        int rc, ssl_err;
-        switch ((rc = SSL_get_error(hctx->ssl, len))) {
+        const int ssl_err = SSL_get_error(hctx->ssl, len);
+        switch (ssl_err) {
         case SSL_ERROR_WANT_WRITE:
             con->is_writable = -1;
             __attribute_fallthrough__
@@ -4247,32 +4604,32 @@ connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max
              *   errno for details).
              *
              */
-            while((ssl_err = ERR_get_error())) {
-                /* get all errors from the error-queue */
-                log_error(hctx->errh, __FILE__, __LINE__,
-                  "SSL: %d %s", rc, ERR_error_string(ssl_err, NULL));
-            }
-
-            switch(oerrno) {
+           {
+            const int errnum = errno;
+            switch(errnum) {
+            case EPIPE:
             case ECONNRESET:
                 if (!hctx->conf.ssl_log_noise) break;
                 __attribute_fallthrough__
             default:
-                /* (oerrno should be something like ECONNABORTED not 0
+                /* (errnum should be something like ECONNABORTED not 0
                  *  if client disconnected before anything was sent
                  *  (e.g. TCP connection probe), but it does not appear
                  *  that openssl provides such notification, not even
                  *  something like SSL_R_SSL_HANDSHAKE_FAILURE) */
-                if (0==oerrno && 0==cq->bytes_in && !hctx->conf.ssl_log_noise)
+                if (0==errnum && 0==cq->bytes_in && !hctx->conf.ssl_log_noise)
                     break;
 
-                errno = oerrno; /*(for log_perror())*/
-                log_perror(hctx->errh, __FILE__, __LINE__,
-                  "SSL: %d %d %d", len, rc, oerrno);
+                if (0 == ERR_peek_error())
+                    log_perror(hctx->errh, __FILE__, __LINE__,
+                      "SSL: addr:%s ssl_err:%d rd:%d errno:%d",
+                      con->dst_addr_buf.ptr, ssl_err, len, errnum);
+                else
+                    elogc(hctx, __FILE__, __LINE__, ssl_err);
                 break;
             }
-
             break;
+           }
         case SSL_ERROR_ZERO_RETURN:
             /* clean shutdown on the remote side */
 
@@ -4286,33 +4643,11 @@ connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max
 
             /*__attribute_fallthrough__*/
         default:
-            while((ssl_err = ERR_get_error())) {
-                switch (ERR_GET_REASON(ssl_err)) {
-                case SSL_R_SSL_HANDSHAKE_FAILURE:
-              #ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
-                case SSL_R_UNEXPECTED_EOF_WHILE_READING:
-              #endif
-              #ifdef SSL_R_TLSV1_ALERT_UNKNOWN_CA
-                case SSL_R_TLSV1_ALERT_UNKNOWN_CA:
-              #endif
-              #ifdef SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN
-                case SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN:
-              #endif
-              #ifdef SSL_R_SSLV3_ALERT_BAD_CERTIFICATE
-                case SSL_R_SSLV3_ALERT_BAD_CERTIFICATE:
-              #endif
-                    if (!hctx->conf.ssl_log_noise) continue;
-                    break;
-                default:
-                    break;
-                }
-                /* get all errors from the error-queue */
-                log_error(hctx->errh, __FILE__, __LINE__,
-                  "SSL: %d %s (%s)", rc, ERR_error_string(ssl_err, NULL),
-                  con->dst_addr_buf.ptr);
-            }
+            /* get all errors from the error-queue */
+            elogc(hctx, __FILE__, __LINE__, ssl_err);
             break;
         }
+        mod_openssl_detach(hctx); /* non-recoverable; skip CLOSE_NOTIFY */
         return -1;
     } else if (len == 0) {
         con->is_readable = 0;
@@ -4362,8 +4697,7 @@ CONNECTION_FUNC(mod_openssl_handle_con_accept)
         return HANDLER_GO_ON;
     }
     else {
-        log_error(r->conf.errh, __FILE__, __LINE__,
-          "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+        elog(hctx->r->conf.errh, __FILE__, __LINE__, "accept");
         return HANDLER_ERROR;
     }
 }
@@ -4386,7 +4720,7 @@ CONNECTION_FUNC(mod_openssl_handle_con_shut_wr)
 {
     plugin_data *p = p_d;
     handler_ctx *hctx = con->plugin_ctx[p->id];
-    if (NULL == hctx) return HANDLER_GO_ON;
+    if (NULL == hctx || 1 == hctx->close_notify) return HANDLER_GO_ON;
 
     hctx->close_notify = -2;
     if (SSL_is_init_finished(hctx->ssl)) {
@@ -4404,16 +4738,13 @@ static int
 mod_openssl_close_notify(handler_ctx *hctx)
 {
         int ret, ssl_r;
-        unsigned long err;
-        log_error_st *errh;
 
         if (1 == hctx->close_notify) return -2;
 
         ERR_clear_error();
         switch ((ret = SSL_shutdown(hctx->ssl))) {
         case 1:
-            mod_openssl_detach(hctx);
-            return -2;
+            break;
         case 0:
             /* Drain SSL read buffers in case pending records need processing.
              * Limit to reading next record to avoid denial of service when CPU
@@ -4445,60 +4776,54 @@ mod_openssl_close_notify(handler_ctx *hctx)
             }
 
             ERR_clear_error();
-            switch ((ret = SSL_shutdown(hctx->ssl))) {
-            case 1:
-                mod_openssl_detach(hctx);
-                return -2;
-            case 0:
-                hctx->close_notify = -1;
-                return 0;
-            default:
+            ret = SSL_shutdown(hctx->ssl);
+            if (1 == ret)
                 break;
+            else if (0 == ret) {
+                hctx->close_notify = -1;
+                return 0; /* try again later */
             }
 
             __attribute_fallthrough__
         default:
 
-            if (!SSL_is_init_finished(hctx->ssl)) {
-                mod_openssl_detach(hctx);
-                return -2;
-            }
+            if (!SSL_is_init_finished(hctx->ssl))
+                break;
 
             switch ((ssl_r = SSL_get_error(hctx->ssl, ret))) {
             case SSL_ERROR_WANT_WRITE:
             case SSL_ERROR_WANT_READ:
-            case SSL_ERROR_ZERO_RETURN: /*(unexpected here)*/
                 hctx->close_notify = -1;
                 return 0; /* try again later */
             case SSL_ERROR_SYSCALL:
-                if (0 == ERR_peek_error()) {
-                    switch(errno) {
+                {
+                    const int errnum = errno;
+                    switch (errnum) {
                     case 0: /*ssl bug (see lighttpd ticket #2213)*/
                     case EPIPE:
                     case ECONNRESET:
-                        mod_openssl_detach(hctx);
-                        return -2;
+                        break;
                     default:
-                        log_perror(hctx->r->conf.errh, __FILE__, __LINE__,
-                          "SSL (error): %d %d", ssl_r, ret);
+                        if (0 == ERR_peek_error())
+                            log_perror(hctx->r->conf.errh, __FILE__, __LINE__,
+                              "SSL: addr:%s ssl_err:%d ret:%d errno:%d",
+                              hctx->con->dst_addr_buf.ptr, ssl_r, ret, errnum);
+                        else
+                            elogc(hctx, __FILE__, __LINE__, ssl_r);
                         break;
                     }
-                    break;
                 }
-                __attribute_fallthrough__
+                break;
             default:
-                errh = hctx->r->conf.errh;
-                while((err = ERR_get_error())) {
-                    log_error(errh, __FILE__, __LINE__,
-                      "SSL: %d %d %s", ssl_r, ret, ERR_error_string(err, NULL));
-                }
-
+                elogc(hctx, __FILE__, __LINE__, ssl_r);
                 break;
             }
+
+            break;
         }
-        ERR_clear_error();
-        hctx->close_notify = -1;
-        return ret;
+
+        mod_openssl_detach(hctx);
+        return -2;
 }
 
 
@@ -4640,6 +4965,7 @@ https_add_ssl_client_entries (request_st * const r, handler_ctx * const hctx)
 
 
 #ifdef LIGHTTPD_OPENSSL_ECH_DEBUG
+#if !defined(BORINGSSL_API_VERSION)
 static void
 http_cgi_ssl_ech(request_st * const r, SSL * const ssl)
 {
@@ -4657,6 +4983,7 @@ http_cgi_ssl_ech(request_st * const r, SSL * const ssl)
     OPENSSL_free(sni_ech);
     OPENSSL_free(sni_clr);
 }
+#endif
 #endif
 
 
@@ -4683,7 +5010,9 @@ http_cgi_ssl_env (request_st * const r, handler_ctx * const hctx)
     }
 
   #ifdef LIGHTTPD_OPENSSL_ECH_DEBUG
+  #if !defined(BORINGSSL_API_VERSION)
     http_cgi_ssl_ech(r, hctx->ssl);
+  #endif
   #endif
 }
 
@@ -4754,8 +5083,7 @@ mod_openssl_refresh_plugin_ssl_ctx (server * const srv, plugin_ssl_ctx * const s
 
   #if 0 /* disabled due to openssl quirks selecting incorrect certificate */
     if (1 != mod_openssl_SSL_CTX_use_cert_and_key(s->ssl_ctx, s->pc, s->kp)) {
-        log_error(srv->errh, __FILE__, __LINE__,
-          "SSL: %s %s %s", ERR_error_string(ERR_get_error(), NULL),
+        elogf(srv->errh, __FILE__, __LINE__, "%s %s",
           s->pc->ssl_pemfile->ptr, s->pc->ssl_privkey->ptr);
         /* no recovery until admin fixes input files */
     }
@@ -4925,7 +5253,8 @@ int mod_openssl_plugin_init (plugin *p)
 }
 
 
-#if defined(LIBRESSL_VERSION_NUMBER)
+#if defined(BORINGSSL_API_VERSION) \
+ || defined(LIBRESSL_VERSION_NUMBER)
 
 static int
 mod_openssl_ssl_conf_proto_val (server *srv, const buffer *b, int max)
@@ -5112,8 +5441,7 @@ mod_openssl_ssl_conf_cmd (server *srv, plugin_config_socket *s)
     if (ciphersuites && !buffer_is_blank(ciphersuites)) {
       #if defined(LIBRESSL_VERSION_NUMBER) && defined(LIBRESSL_HAS_TLS1_3)
         if (SSL_CTX_set_ciphersuites(s->ssl_ctx, ciphersuites->ptr) != 1) {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+            elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_set_ciphersuites");
             rc = -1;
         }
       #endif
@@ -5124,8 +5452,7 @@ mod_openssl_ssl_conf_cmd (server *srv, plugin_config_socket *s)
         buffer_append_string_len(cipherstring,
                                  CONST_STR_LEN(":!aNULL:!eNULL:!EXP"));
         if (SSL_CTX_set_cipher_list(s->ssl_ctx, cipherstring->ptr) != 1) {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+            elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_set_cipher_list");
             rc = -1;
         }
 
@@ -5141,4 +5468,4 @@ mod_openssl_ssl_conf_cmd (server *srv, plugin_config_socket *s)
     return rc;
 }
 
-#endif /* LIBRESSL_VERSION_NUMBER */
+#endif /* BORINGSSL_API_VERSION || LIBRESSL_VERSION_NUMBER */
