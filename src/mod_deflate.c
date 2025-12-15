@@ -136,6 +136,7 @@
 #include "http_chunk.h"
 #include "http_etag.h"
 #include "http_header.h"
+#include "http_status.h"
 #include "response.h"
 #include "stat_cache.h"
 
@@ -224,7 +225,6 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 
     buffer tmp_buf;
 } plugin_data;
@@ -248,7 +248,11 @@ typedef struct {
 	off_t bytes_in;
 	off_t bytes_out;
 	buffer *output;
-	plugin_data *plugin_data;
+	struct {
+		unsigned short	sync_flush;
+		short		compression_level;
+		const encparms *params;
+	} conf;
 	request_st *r;
 	int compression_type;
 	int cache_fd;
@@ -257,10 +261,16 @@ typedef struct {
 } handler_ctx;
 
 __attribute_returns_nonnull__
-static handler_ctx *handler_ctx_init(void) {
+static handler_ctx *handler_ctx_init (request_st * const r, const plugin_config * const pconf, int compression_type) {
 	handler_ctx * const hctx = ck_calloc(1, sizeof(*hctx));
 	chunkqueue_init(&hctx->in_queue);
 	hctx->cache_fd = -1;
+	hctx->compression_type = compression_type;
+	hctx->r = r;
+	/*(selective copy rather than entire plugin_config)*/
+	hctx->conf.sync_flush = pconf->sync_flush;
+	hctx->conf.compression_level = pconf->compression_level;
+	hctx->conf.params = pconf->params;
 	return hctx;
 }
 
@@ -344,6 +354,15 @@ static buffer * mod_deflate_cache_file_name(request_st * const r, const buffer *
                               BUF_PTR_LEN(&r->physical.path));
     buffer_append_str2(tb, CONST_STR_LEN("-"), /*(strip surrounding '"')*/
                            etag->ptr+1, buffer_clen(etag)-2);
+    /* translate any '/' (and backslash on Windows) in appended etag to '~' */
+    char *ptr = tb->ptr + buffer_clen(tb) - (buffer_clen(etag)-2) - 1;
+    while (*++ptr) {
+      #if defined(_WIN32) || defined(__CYGWIN__)
+        if (*ptr == '/' || *ptr == '\\') *ptr = '~';
+      #else
+        if (*ptr == '/') *ptr = '~';
+      #endif
+    }
     return tb;
 }
 
@@ -444,11 +463,11 @@ static void mod_deflate_merge_config(plugin_config * const pconf, const config_p
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_deflate_patch_config(request_st * const r, plugin_data * const p) {
-    memcpy(&p->conf, &p->defaults, sizeof(plugin_config));
+static void mod_deflate_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_deflate_merge_config(&p->conf, p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_deflate_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -936,11 +955,10 @@ static int stream_deflate_init(handler_ctx *hctx) {
 	z->next_out = (unsigned char *)hctx->output->ptr;
 	z->avail_out = hctx->output->size;
 
-	const plugin_data * const p = hctx->plugin_data;
-	const encparms * const params = p->conf.params;
+	const encparms * const params = hctx->conf.params;
 	const int clevel = (NULL != params)
 	  ? params->gzip.clevel
-	  : p->conf.compression_level;
+	  : hctx->conf.compression_level;
 	const int wbits = (NULL != params)
 	  ? params->gzip.windowBits
 	  : MAX_WBITS;
@@ -987,7 +1005,6 @@ static int stream_deflate_compress(handler_ctx * const hctx, const unsigned char
 
 static int stream_deflate_flush(handler_ctx * const hctx, int end) {
 	z_stream * const z = &(hctx->u.z);
-	const plugin_data *p = hctx->plugin_data;
 	size_t len;
 	int rc = 0;
 	int done;
@@ -1003,7 +1020,7 @@ static int stream_deflate_flush(handler_ctx * const hctx, int end) {
 				return -1;
 			}
 		} else {
-			if (p->conf.sync_flush) {
+			if (hctx->conf.sync_flush) {
 				rc = deflate(z, Z_SYNC_FLUSH);
 				if (rc != Z_OK) return -1;
 			} else if (z->avail_in > 0) {
@@ -1013,7 +1030,7 @@ static int stream_deflate_flush(handler_ctx * const hctx, int end) {
 		}
 
 		len = hctx->output->size - z->avail_out;
-		if (z->avail_out == 0 || (len > 0 && (end || p->conf.sync_flush))) {
+		if (z->avail_out == 0 || (len > 0 && (end || hctx->conf.sync_flush))) {
 			hctx->bytes_out += len;
 			if (0 != stream_http_chunk_append_mem(hctx, hctx->output->ptr, len))
 				return -1;
@@ -1057,15 +1074,14 @@ static int stream_bzip2_init(handler_ctx *hctx) {
 	bz->next_out = hctx->output->ptr;
 	bz->avail_out = hctx->output->size;
 
-	const plugin_data * const p = hctx->plugin_data;
-	const encparms * const params = p->conf.params;
+	const encparms * const params = hctx->conf.params;
 	const int clevel = (NULL != params)
 	  ? params->bzip2.clevel
-	  : p->conf.compression_level;
+	  : hctx->conf.compression_level;
 
 	if (BZ_OK != BZ2_bzCompressInit(bz,
 					clevel > 0
-					 ? p->conf.compression_level
+					 ? hctx->conf.compression_level
 					 : 9, /* blocksize = 900k */
 					0,    /* verbosity */
 					0)) { /* workFactor: default */
@@ -1102,7 +1118,6 @@ static int stream_bzip2_compress(handler_ctx * const hctx, const unsigned char *
 
 static int stream_bzip2_flush(handler_ctx * const hctx, int end) {
 	bz_stream * const bz = &(hctx->u.bz);
-	const plugin_data *p = hctx->plugin_data;
 	size_t len;
 	int rc;
 	int done;
@@ -1118,7 +1133,7 @@ static int stream_bzip2_flush(handler_ctx * const hctx, int end) {
 				return -1;
 			}
 		} else if (bz->avail_in > 0) {
-			/* p->conf.sync_flush not implemented here,
+			/* hctx->conf.sync_flush not implemented here,
 			 * which would loop on BZ_FLUSH while BZ_FLUSH_OK
 			 * until BZ_RUN_OK returned */
 			rc = BZ2_bzCompress(bz, BZ_RUN);
@@ -1128,7 +1143,7 @@ static int stream_bzip2_flush(handler_ctx * const hctx, int end) {
 		}
 
 		len = hctx->output->size - bz->avail_out;
-		if (bz->avail_out == 0 || (len > 0 && (end || p->conf.sync_flush))) {
+		if (bz->avail_out == 0 || (len > 0 && (end || hctx->conf.sync_flush))) {
 			hctx->bytes_out += len;
 			if (0 != stream_http_chunk_append_mem(hctx, hctx->output->ptr, len))
 				return -1;
@@ -1161,12 +1176,11 @@ static int stream_br_init(handler_ctx *hctx) {
     if (NULL == br) return -1;
 
     /*(note: we ignore any errors while tuning parameters here)*/
-    const plugin_data * const p = hctx->plugin_data;
-    const encparms * const params = p->conf.params;
+    const encparms * const params = hctx->conf.params;
     const uint32_t quality = (NULL != params)
       ? params->brotli.quality
-      : (p->conf.compression_level >= 0) /* 0 .. 11 are valid values */
-        ? (uint32_t)p->conf.compression_level
+      : (hctx->conf.compression_level >= 0) /* 0 .. 11 are valid values */
+        ? (uint32_t)hctx->conf.compression_level
         : 5;
         /* BROTLI_DEFAULT_QUALITY is 11 and can be *very* time-consuming */
     if (quality != BROTLI_DEFAULT_QUALITY)
@@ -1255,8 +1269,7 @@ static int stream_zstd_init(handler_ctx *hctx) {
     hctx->output->used = 0;
 
     /*(note: we ignore any errors while tuning parameters here)*/
-    const plugin_data * const p = hctx->plugin_data;
-    const encparms * const params = p->conf.params;
+    const encparms * const params = hctx->conf.params;
     if (params) {
         if (params->zstd.clevel && params->zstd.clevel != ZSTD_CLEVEL_DEFAULT) {
             const int level = params->zstd.clevel;
@@ -1275,8 +1288,8 @@ static int stream_zstd_init(handler_ctx *hctx) {
                                    params->zstd.windowLog);
       #endif
     }
-    else if (p->conf.compression_level >= 0) { /* -1 here is "unset" */
-        int level = p->conf.compression_level;
+    else if (hctx->conf.compression_level >= 0) { /* -1 here is "unset" */
+        int level = hctx->conf.compression_level;
       #if ZSTD_VERSION_NUMBER >= 10000+400+0 /* v1.4.0 */
         ZSTD_CCtx_setParameter(cctx, ZSTD_c_strategy, level);
       #else
@@ -1458,18 +1471,23 @@ static int mod_deflate_stream_end(handler_ctx *hctx) {
 	}
 }
 
-static int deflate_compress_cleanup(request_st * const r, handler_ctx * const hctx) {
-	int rc = mod_deflate_stream_end(hctx);
+static handler_t mod_deflate_finished(request_st * const r, handler_ctx * const hctx, const buffer * const tb) {
+  #ifdef __COVERITY__
+    /* coverity misses if hctx->cache_fd is not -1, then tb is not NULL */
+    force_assert(-1 == hctx->cache_fd || NULL != tb);
+  #endif
+    if (-1 != hctx->cache_fd && 0 != mod_deflate_cache_file_finish(r, hctx, tb))
+        return HANDLER_ERROR;
 
-      #if 1 /* unnecessary if deflate.min-compress-size is set to a reasonable value */
-	if (0 == rc && hctx->bytes_in < hctx->bytes_out)
-		log_error(r->conf.errh, __FILE__, __LINE__,
-		  "uri %s in=%lld smaller than out=%lld", r->target.ptr,
-		  (long long)hctx->bytes_in, (long long)hctx->bytes_out);
-      #endif
+  #if 1 /* unnecessary if deflate.min-compress-size is set to a reasonable value */
+    if (hctx->bytes_in < hctx->bytes_out)
+        log_error(r->conf.errh, __FILE__, __LINE__,
+          "uri %s in=%lld smaller than out=%lld", r->target.ptr,
+          (long long)hctx->bytes_in, (long long)hctx->bytes_out);
+  #endif
 
-	handler_ctx_free(hctx);
-	return rc;
+    mod_deflate_note_ratio(r, hctx->bytes_out, hctx->bytes_in);
+    return HANDLER_GO_ON;
 }
 
 
@@ -1498,12 +1516,12 @@ static int mod_deflate_using_libdeflate_err (handler_ctx * const hctx, buffer * 
 }
 
 
-static int mod_deflate_using_libdeflate_sm (handler_ctx * const hctx, const plugin_data * const p)
+static int mod_deflate_using_libdeflate_sm (handler_ctx * const hctx)
 {
-    const encparms * const params = p->conf.params;
+    const encparms * const params = hctx->conf.params;
     const int clevel = (NULL != params)
       ? params->gzip.clevel
-      : p->conf.compression_level;
+      : hctx->conf.compression_level;
     struct libdeflate_compressor * const compressor =
       libdeflate_alloc_compressor(clevel > 0 ? clevel : 6);
       /* Z_DEFAULT_COMPRESSION -1 not supported */
@@ -1560,7 +1578,7 @@ static off_t mod_deflate_using_libdeflate_setjmp_cb (void *dst, const void *src,
 }
 
 
-static int mod_deflate_using_libdeflate (handler_ctx * const hctx, const plugin_data * const p)
+static int mod_deflate_using_libdeflate (handler_ctx * const hctx)
 {
     buffer * const fn = hctx->output; /*(&p->tmp_buf)*/
     int fd = hctx->cache_fd;
@@ -1601,10 +1619,10 @@ static int mod_deflate_using_libdeflate (handler_ctx * const hctx, const plugin_
         return mod_deflate_using_libdeflate_err(hctx, fn, fd);
     }
 
-    const encparms * const params = p->conf.params;
+    const encparms * const params = hctx->conf.params;
     const int clevel = (NULL != params)
       ? params->gzip.clevel
-      : p->conf.compression_level;
+      : hctx->conf.compression_level;
     struct libdeflate_compressor * const compressor =
       libdeflate_alloc_compressor(clevel > 0 ? clevel : 6);
       /* Z_DEFAULT_COMPRESSION -1 not supported */
@@ -1760,7 +1778,7 @@ static handler_t deflate_compress_response(request_st * const r, handler_ctx * c
 	max = chunkqueue_length(&hctx->in_queue);
       #if 0
 	/* calculate max bytes to compress for this call */
-	if (p->conf.sync_flush && max > (len = p->conf.work_block_size << 10)) {
+	if (hctx->conf.sync_flush && max > (len = hctx->conf.work_block_size << 10)) {
 		max = len;
 	}
       #endif
@@ -1809,7 +1827,7 @@ static handler_t deflate_compress_response(request_st * const r, handler_ctx * c
 }
 
 
-static int mod_deflate_choose_encoding (const char *value, plugin_data *p, const char **label) {
+static int mod_deflate_choose_encoding (const char *value, const plugin_config * const pconf, const char **label) {
 	/* get client side support encodings */
 	int accept_encoding = 0;
       #if !defined(USE_ZLIB) && !defined(USE_BZ2LIB) && !defined(USE_BROTLI) \
@@ -1884,7 +1902,7 @@ static int mod_deflate_choose_encoding (const char *value, plugin_data *p, const
       #endif
 
 	/* select best matching encoding */
-	const uint16_t *x = p->conf.allowed_encodings;
+	const uint16_t *x = pconf->allowed_encodings;
 	if (NULL == x) return 0;
 	while (*x && !(*x & accept_encoding)) ++x;
 	accept_encoding &= *x;
@@ -1980,7 +1998,6 @@ int mod_deflate_try_precomp(request_st *r, char *ext, int enc, char *encname, co
 }
 
 REQUEST_FUNC(mod_deflate_handle_response_start) {
-	plugin_data *p = p_d;
 	const buffer *vbro;
 	buffer *vb;
 	handler_ctx *hctx;
@@ -2014,17 +2031,18 @@ REQUEST_FUNC(mod_deflate_handle_response_start) {
 		return HANDLER_GO_ON;
 	}
 
-	mod_deflate_patch_config(r, p);
+	plugin_config pconf;
+	mod_deflate_patch_config(r, p_d, &pconf);
 
 	/* check if deflate configured for any mimetypes */
-	if (NULL == p->conf.mimetypes) return HANDLER_GO_ON;
+	if (NULL == pconf.mimetypes) return HANDLER_GO_ON;
 
 	/* check if size of response is below min-compress-size or exceeds max*/
 	/* (r->resp_body_finished checked at top of routine) */
 	len = chunkqueue_length(&r->write_queue);
-	if (len <= (off_t)p->conf.min_compress_size) return HANDLER_GO_ON;
-	if (p->conf.max_compress_size /*(max_compress_size in KB)*/
-	    && len > ((off_t)p->conf.max_compress_size << 10)) {
+	if (len <= (off_t)pconf.min_compress_size) return HANDLER_GO_ON;
+	if (pconf.max_compress_size /*(max_compress_size in KB)*/
+	    && len > ((off_t)pconf.max_compress_size << 10)) {
 		return HANDLER_GO_ON;
 	}
 
@@ -2047,16 +2065,16 @@ REQUEST_FUNC(mod_deflate_handle_response_start) {
 
 	/* find matching encodings */
 	if (!precomp_sce)
-		compression_type = mod_deflate_choose_encoding(vbro->ptr, p, &label);
+		compression_type = mod_deflate_choose_encoding(vbro->ptr, &pconf, &label);
 	if (!compression_type) return HANDLER_GO_ON;
 
 	/* Check mimetype in response header "Content-Type" */
 	if (!precomp_sce) {
 		if (NULL != (vbro = http_header_response_get(r, HTTP_HEADER_CONTENT_TYPE, CONST_STR_LEN("Content-Type")))) {
-			if (NULL == array_match_value_prefix(p->conf.mimetypes, vbro)) return HANDLER_GO_ON;
+			if (NULL == array_match_value_prefix(pconf.mimetypes, vbro)) return HANDLER_GO_ON;
 		} else {
 			/* If no Content-Type set, compress only if first p->conf.mimetypes value is "" */
-			data_string *mimetype = (data_string *)p->conf.mimetypes->data[0];
+			data_string *mimetype = (data_string *)pconf.mimetypes->data[0];
 			if (!buffer_is_blank(&mimetype->value)) return HANDLER_GO_ON;
 		}
 	}
@@ -2094,22 +2112,20 @@ REQUEST_FUNC(mod_deflate_handle_response_start) {
 			} else {
 				r->http_status = 412;
 			}
+			http_status_set_fin(r, r->http_status);
 
 			/* response_start hook occurs after error docs have been handled.
 			 * For now, send back empty response body.
 			 * In the future, might extract the error doc code so that it
 			 * might be run again if response_start hooks return with
-			 * changed http_status and r->handler_module = NULL */
+			 * changed http_status and r->handler_module NULL */
 			/* clear content length even if 304 since compressed length unknown */
 			http_response_body_clear(r, 0);
-
-			r->resp_body_finished = 1;
-			r->handler_module = NULL;
 			return HANDLER_GO_ON;
 		}
 	}
 
-	if (!precomp_sce && (0.0 < p->conf.max_loadavg && p->conf.max_loadavg < r->con->srv->loadavg[0])) {
+	if (!precomp_sce && (0.0 < pconf.max_loadavg && pconf.max_loadavg < r->con->srv->loadavg[0])) {
 		return HANDLER_GO_ON;
 	}
 
@@ -2162,7 +2178,7 @@ REQUEST_FUNC(mod_deflate_handle_response_start) {
 	 *       file
 	 */
 	buffer *tb = NULL;
-	if (p->conf.cache_dir
+	if (pconf.cache_dir
 	    && !had_vary
 	    && etaglen > 2
 	    && r->resp_body_finished
@@ -2178,7 +2194,7 @@ REQUEST_FUNC(mod_deflate_handle_response_start) {
 	            && !http_header_str_contains_token(BUF_PTR_LEN(vbro),
 	                                               CONST_STR_LEN("no-store"))))
 	   ) {
-		tb = mod_deflate_cache_file_name(r, p->conf.cache_dir, vb);
+		tb = mod_deflate_cache_file_name(r, pconf.cache_dir, vb);
 		/*(checked earlier and skipped if Transfer-Encoding had been set)*/
 		stat_cache_entry *sce = stat_cache_get_entry_open(tb, 1);
 		if (NULL != sce) {
@@ -2201,15 +2217,14 @@ REQUEST_FUNC(mod_deflate_handle_response_start) {
 	}
 
 	/* enable compression */
-	p->conf.sync_flush =
+	pconf.sync_flush =
 	  ((r->conf.stream_response_body
 	    & (FDEVENT_STREAM_RESPONSE | FDEVENT_STREAM_RESPONSE_BUFMIN))
-	   && 0 == p->conf.output_buffer_size);
-	hctx = handler_ctx_init();
-	hctx->plugin_data = p;
-	hctx->compression_type = compression_type;
-	hctx->r = r;
+	   && 0 == pconf.output_buffer_size);
+	hctx = handler_ctx_init(r, &pconf, compression_type);
 	/* setup output buffer */
+        /* thread-safety todo: p->tmp_buf per-thread */
+	plugin_data *p = p_d;
 	buffer_clear(&p->tmp_buf);
 	hctx->output = &p->tmp_buf;
 	/* open cache file if caching compressed file */
@@ -2229,13 +2244,9 @@ REQUEST_FUNC(mod_deflate_handle_response_start) {
 	    && c->type == FILE_CHUNK
 	    && chunkqueue_chunk_file_view(c, len, r->conf.errh)
 	    && chunk_file_view_dlen(c->file.view, c->offset) >= len) { /*(cfv)*/
-		rc = HANDLER_GO_ON;
 		hctx->bytes_in = len;
-		if (mod_deflate_using_libdeflate(hctx, p)) {
-			if (NULL == tb || 0 == mod_deflate_cache_file_finish(r, hctx, tb))
-				mod_deflate_note_ratio(r, hctx->bytes_out, hctx->bytes_in);
-			else
-				rc = HANDLER_ERROR;
+		if (mod_deflate_using_libdeflate(hctx)) {
+			rc = mod_deflate_finished(r, hctx, tb);
 			handler_ctx_free(hctx);
 			return rc;
 		}
@@ -2250,13 +2261,9 @@ REQUEST_FUNC(mod_deflate_handle_response_start) {
 	    && c == r->write_queue.last
 	    && c->type == MEM_CHUNK) {
 		/*(skip if FILE_CHUNK; not worth mmap/munmap overhead on small file)*/
-		rc = HANDLER_GO_ON;
 		hctx->bytes_in = len;
-		if (mod_deflate_using_libdeflate_sm(hctx, p)) {
-			if (NULL == tb || 0 == mod_deflate_cache_file_finish(r, hctx, tb))
-				mod_deflate_note_ratio(r, hctx->bytes_out, hctx->bytes_in);
-			else
-				rc = HANDLER_ERROR;
+		if (mod_deflate_using_libdeflate_sm(hctx)) {
+			rc = mod_deflate_finished(r, hctx, tb);
 			handler_ctx_free(hctx);
 			return rc;
 		}
@@ -2288,25 +2295,17 @@ REQUEST_FUNC(mod_deflate_handle_response_start) {
 	if (light_btst(r->resp_htags, HTTP_HEADER_CONTENT_LENGTH)) {
 		http_header_response_unset(r, HTTP_HEADER_CONTENT_LENGTH, CONST_STR_LEN("Content-Length"));
 	}
-	r->plugin_ctx[p->id] = hctx;
 
 	rc = deflate_compress_response(r, hctx);
-	if (HANDLER_GO_ON == rc) return HANDLER_GO_ON;
-	if (HANDLER_FINISHED == rc) {
-	  #ifdef __COVERITY__
-		/* coverity misses if hctx->cache_fd is not -1, then tb is not NULL */
-		force_assert(-1 == hctx->cache_fd || NULL != tb);
-	  #endif
-		if (-1 == hctx->cache_fd
-		    || 0 == mod_deflate_cache_file_finish(r, hctx, tb)) {
-			mod_deflate_note_ratio(r, hctx->bytes_out, hctx->bytes_in);
-			rc = HANDLER_GO_ON;
-		}
-		else
+	if (HANDLER_GO_ON == rc)
+		r->plugin_ctx[p->id] = hctx;
+	else {
+		if (mod_deflate_stream_end(hctx) < 0)
 			rc = HANDLER_ERROR;
+		else if (HANDLER_FINISHED == rc)
+			rc = mod_deflate_finished(r, hctx, tb);
+		handler_ctx_free(hctx);
 	}
-	r->plugin_ctx[p->id] = NULL;
-	if (deflate_compress_cleanup(r, hctx) < 0) return HANDLER_ERROR;
 	return rc;
 }
 
@@ -2316,7 +2315,8 @@ static handler_t mod_deflate_cleanup(request_st * const r, void *p_d) {
 
 	if (NULL != hctx) {
 		r->plugin_ctx[p->id] = NULL;
-		deflate_compress_cleanup(r, hctx);
+		mod_deflate_stream_end(hctx);
+		handler_ctx_free(hctx);
 	}
 
 	return HANDLER_GO_ON;

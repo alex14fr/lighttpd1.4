@@ -89,6 +89,7 @@
 #include "chunk.h"
 #include "fdevent.h"
 #include "http_header.h"
+#include "http_status.h"
 #include "log.h"
 
 #define MOD_WEBSOCKET_LOG_NONE  0
@@ -118,8 +119,7 @@ typedef struct {
 
 typedef struct plugin_data {
     PLUGIN_DATA;
-    pid_t srv_pid; /* must match layout of gw_plugin_data through conf member */
-    plugin_config conf;
+    pid_t srv_pid; /* must match layout of gw_plugin_data to defaults member */
     plugin_config defaults;
 } plugin_data;
 
@@ -229,11 +229,11 @@ static void mod_wstunnel_merge_config(plugin_config * const pconf, const config_
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_wstunnel_patch_config(request_st * const r, plugin_data * const p) {
-    memcpy(&p->conf, &p->defaults, sizeof(plugin_config));
+static void mod_wstunnel_patch_config(request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_wstunnel_merge_config(&p->conf, p->cvlist+p->cvlist[i].v.u2[0]);
+            mod_wstunnel_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -421,7 +421,7 @@ static int wstunnel_is_allowed_origin(request_st * const r, handler_ctx * const 
 
     if (NULL == allowed_origins || 0 == allowed_origins->used) {
         DEBUG_LOG_INFO("%s", "allowed origins not specified");
-        return 1;
+        return 0;
     }
 
     /* "Origin" header is preferred
@@ -434,8 +434,7 @@ static int wstunnel_is_allowed_origin(request_st * const r, handler_ctx * const 
     olen = origin ? buffer_clen(origin) : 0;
     if (0 == olen) {
         DEBUG_LOG_ERR("%s", "Origin header is invalid");
-        r->http_status = 400; /* Bad Request */
-        return 0;
+        return 400; /* Bad Request */
     }
 
     for (size_t i = 0; i < allowed_origins->used; ++i) {
@@ -444,38 +443,21 @@ static int wstunnel_is_allowed_origin(request_st * const r, handler_ctx * const 
         if ((olen > blen ? origin->ptr[olen-blen-1] == '.' : olen == blen)
             && 0 == memcmp(origin->ptr+olen-blen, b->ptr, blen)) {
             DEBUG_LOG_INFO("%s matches allowed origin: %s",origin->ptr,b->ptr);
-            return 1;
+            return 0;
         }
     }
     DEBUG_LOG_INFO("%s does not match any allowed origins", origin->ptr);
-    r->http_status = 403; /* Forbidden */
-    return 0;
+    return 403; /* Forbidden */
 }
 
 static int wstunnel_check_request(request_st * const r, handler_ctx * const hctx) {
-    const buffer * const vers =
-      http_header_request_get(r, HTTP_HEADER_OTHER, CONST_STR_LEN("Sec-WebSocket-Version"));
-    const long hybivers = (NULL != vers)
-      ? light_isdigit(*vers->ptr) ? strtol(vers->ptr, NULL, 10) : -1
-      : 0;
-    if (hybivers < 0 || hybivers > INT_MAX) {
-        DEBUG_LOG_ERR("%s", "invalid Sec-WebSocket-Version");
-        r->http_status = 400; /* Bad Request */
-        return -1;
-    }
-
     /*(redundant since HTTP/1.1 required in mod_wstunnel_check_extension())*/
     if (!r->http_host || buffer_is_blank(r->http_host)) {
         DEBUG_LOG_ERR("%s", "Host header does not exist");
-        r->http_status = 400; /* Bad Request */
-        return -1;
+        return 400; /* Bad Request */
     }
 
-    if (!wstunnel_is_allowed_origin(r, hctx)) {
-        return -1;
-    }
-
-    return (int)hybivers;
+    return wstunnel_is_allowed_origin(r, hctx);
 }
 
 static void wstunnel_backend_error(gw_handler_ctx *gwhctx) {
@@ -490,17 +472,25 @@ static void wstunnel_handler_ctx_free(void *gwhctx) {
     chunk_buffer_release(hctx->frame.payload);
 }
 
-static handler_t wstunnel_handler_setup (request_st * const r, plugin_data * const p) {
-    handler_ctx *hctx = r->plugin_ctx[p->id];
-    int hybivers;
+static handler_t wstunnel_handler_setup (request_st * const r, handler_ctx * const hctx, const plugin_config * const pconf) {
     hctx->errh = r->conf.errh;/*(for mod_wstunnel-specific DEBUG_* macros)*/
-    hctx->conf = p->conf; /*(copies struct)*/
-    hybivers = wstunnel_check_request(r, hctx);
-    if (hybivers < 0) {
-        r->handler_module = NULL;
-        return HANDLER_FINISHED;
+    memcpy(&hctx->conf, pconf, sizeof(plugin_config));
+
+    int status = wstunnel_check_request(r, hctx);
+    if (status)
+        return http_status_set_err(r, status);
+
+    const buffer * const vers =
+      http_header_request_get(r, HTTP_HEADER_OTHER,
+                                 CONST_STR_LEN("Sec-WebSocket-Version"));
+    const long hybivers = (NULL != vers)
+      ? light_isdigit(*vers->ptr) ? strtol(vers->ptr, NULL, 10) : -1
+      : 0;
+    if (hybivers < 0 || hybivers > INT_MAX) {
+        DEBUG_LOG_ERR("%s", "invalid Sec-WebSocket-Version");
+        return http_status_set_err(r, 400); /* Bad Request */
     }
-    hctx->hybivers = hybivers;
+    hctx->hybivers = (int)hybivers;
     if (0 == hybivers) {
         DEBUG_LOG_INFO("WebSocket Version = %s", "hybi-00");
     }
@@ -572,9 +562,6 @@ static handler_t wstunnel_handler_setup (request_st * const r, plugin_data * con
 }
 
 static handler_t mod_wstunnel_check_extension(request_st * const r, void *p_d) {
-    plugin_data *p = p_d;
-    handler_t rc;
-
     if (NULL != r->handler_module)
         return HANDLER_GO_ON;
   if (r->http_version > HTTP_VERSION_1_1) {
@@ -602,13 +589,17 @@ static handler_t mod_wstunnel_check_extension(request_st * const r, void *p_d) {
         return HANDLER_GO_ON;
   }
 
-    mod_wstunnel_patch_config(r, p);
-    if (NULL == p->conf.gw.exts) return HANDLER_GO_ON;
-    p->conf.gw.upgrade = 1;
+    plugin_config pconf;
+    mod_wstunnel_patch_config(r, p_d, &pconf);
+    if (NULL == pconf.gw.exts) return HANDLER_GO_ON;
+    pconf.gw.upgrade = 1;
 
-    rc = gw_check_extension(r, (gw_plugin_data *)p, 1, sizeof(handler_ctx));
+    handler_t rc =
+      gw_check_extension(r, (gw_plugin_config *)&pconf,
+                         p_d, 1, sizeof(handler_ctx));
+    const plugin_data * const p = p_d;
     return (HANDLER_GO_ON == rc && r->handler_module == p->self)
-      ? wstunnel_handler_setup(r, p)
+      ? wstunnel_handler_setup(r, r->plugin_ctx[p->id], &pconf)
       : rc;
 }
 

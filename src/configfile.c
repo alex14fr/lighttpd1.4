@@ -140,10 +140,12 @@ static void config_merge_config_cpv(request_config * const pconf, const config_p
         pconf->range_requests = (0 != cpv->v.u);
         break;
       case 16:/* server.stream-request-body */
-        pconf->stream_request_body = cpv->v.shrt;
+        pconf->stream_request_body = cpv->v.shrt
+                                   | FDEVENT_STREAM_REQUEST_CONFIGURED;
         break;
       case 17:/* server.stream-response-body */
-        pconf->stream_response_body = cpv->v.shrt;
+        pconf->stream_response_body = cpv->v.shrt
+                                    | FDEVENT_STREAM_RESPONSE_CONFIGURED;
         break;
       case 18:/* server.kbytes-per-second */
         pconf->global_bytes_per_second = (unsigned int)((off_t *)cpv->v.v)[1];
@@ -768,7 +770,8 @@ static int config_insert_srvconf(server *srv) {
         T_CONFIG_SCOPE_UNSET }
     };
 
-    srv->srvconf.h2proto = 2; /* enable HTTP/2 and h2c by default */
+    http_request_trailer_set_whitelist(NULL); /*(reset after config reload)*/
+    srv->srvconf.h2proto = 1; /* enable HTTP/2 by default */
 
     int rc = 0;
     plugin_data_base srvplug;
@@ -913,7 +916,7 @@ static int config_insert_srvconf(server *srv) {
                     srv->srvconf.h2proto +=
                       config_plugin_value_to_bool(
                         array_get_element_klen(cpv->v.a,
-                                               CONST_STR_LEN("server.h2c")), 1);
+                                               CONST_STR_LEN("server.h2c")), 0);
                 srv->srvconf.absolute_dir_redirect =
                   config_plugin_value_to_bool(
                     array_get_element_klen(cpv->v.a,

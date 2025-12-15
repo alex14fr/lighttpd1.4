@@ -21,6 +21,7 @@
 #include "http_chunk.h"
 #include "http_etag.h"
 #include "http_header.h"
+#include "http_status.h"
 #include "rand.h"
 #include "response.h"   /* http_response_send_1xx() */
 
@@ -59,9 +60,8 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 
-    script_cache cache;
+    script_cache cache; /* thread-safety todo: refcnt and lock around modify */
 } plugin_data;
 
 static plugin_data *mod_magnet_plugin_data;
@@ -116,12 +116,12 @@ static void mod_magnet_merge_config(plugin_config * const pconf, const config_pl
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_magnet_patch_config(request_st * const r, plugin_data * const p) {
-    p->conf = p->defaults; /* copy small struct instead of memcpy() */
-    /*memcpy(&p->conf, &p->defaults, sizeof(plugin_config));*/
+static void mod_magnet_patch_config(request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    *pconf = p->defaults; /* copy small struct instead of memcpy() */
+    /*memcpy(pconf, &p->defaults, sizeof(plugin_config));*/
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_magnet_merge_config(&p->conf, p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_magnet_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -2520,6 +2520,7 @@ static int magnet_respbody(lua_State *L) {
       case 's': /* set; r.resp_body.set */
         if (k[1] == 'e' && k[2] == 't' && k[3] == '\0') {
             http_response_body_clear(r, 0); /* clear respbody, then add */
+            r->resp_body_finished = 1;
             lua_pushlightuserdata(L, r);
             lua_pushcclosure(L, magnet_respbody_add, 1);
             return 1;
@@ -2540,12 +2541,12 @@ static int magnet_reqbody_add(lua_State *L) {
     const int tempfile = (cq->last && cq->last->file.is_temp);
     if (lua_isstring(L, -1)) {
         const_buffer data = magnet_checkconstbuffer(L, -1);
-        r->reqbody_length += data.len;
         if (r->reqbody_length <= 65536 && !tempfile)
             chunkqueue_append_mem(cq, data.ptr, data.len);
         else if (chunkqueue_append_mem_to_tempfile(cq, data.ptr, data.len,
                                                    r->conf.errh))
             return 0; /* boolean false */
+        r->reqbody_length += data.len;
         return 1; /* boolean true */
     }
     else if (!lua_istable(L, -1))
@@ -2556,12 +2557,12 @@ static int magnet_reqbody_add(lua_State *L) {
 
         if (lua_isstring(L, -1)) {
             const_buffer data = magnet_checkconstbuffer(L, -1);
-            r->reqbody_length += data.len;
             if (r->reqbody_length <= 65536 && !tempfile)
                 chunkqueue_append_mem(cq, data.ptr, data.len);
             else if (chunkqueue_append_mem_to_tempfile(cq, data.ptr, data.len,
                                                        r->conf.errh))
                 return 0; /* boolean false */
+            r->reqbody_length += data.len;
         }
         else if (lua_isnil(L, -1)) { /* end of list */
             end = 1;
@@ -2614,6 +2615,8 @@ static int magnet_reqbody(lua_State *L) {
             else if (NULL == r->handler_module) {
                 r->conf.stream_request_body &=
                   ~(FDEVENT_STREAM_REQUEST|FDEVENT_STREAM_REQUEST_BUFMIN);
+                r->conf.stream_request_body |=
+                  FDEVENT_STREAM_REQUEST_CONFIGURED;
                 r->handler_module = mod_magnet_plugin_data->self;
                 lua_pushboolean(L, 0);
             }
@@ -3366,7 +3369,7 @@ static int magnet_traceback(lua_State *L) {
 __attribute_cold__
 __attribute_noinline__
 static int
-magnet_script_setup (request_st * const r, plugin_data * const p, script * const sc)
+magnet_script_setup (request_st * const r, plugin_config * const pconf, script * const sc)
 {
 	lua_State * const L = sc->L;
 	const int func_ndx = 1;
@@ -3406,17 +3409,15 @@ magnet_script_setup (request_st * const r, plugin_data * const p, script * const
 			  "loading script %s failed", sc->name.ptr);
 		lua_settop(L, 0);
 
-		if (p->conf.stage >= 0) { /*(before response_start)*/
-			r->http_status = 500;
-			r->handler_module = NULL;
-		}
+		if (pconf->stage >= 0) /*(before response_start)*/
+			http_status_set_err(r, 500); /* Internal Server Error */
 
 		return 0;
 	}
 }
 
 static handler_t
-magnet_attract (request_st * const r, plugin_data * const p, script * const sc)
+magnet_attract (request_st * const r, plugin_config * const pconf, script * const sc)
 {
 	lua_State * const L = sc->L;
 	const int func_ndx = 1;
@@ -3427,7 +3428,7 @@ magnet_attract (request_st * const r, plugin_data * const p, script * const sc)
 	const int lighty_table_ndx = 6;
 
 	if (__builtin_expect( (lua_gettop(L) != lighty_table_ndx), 0)) {
-		if (!magnet_script_setup(r, p, sc))
+		if (!magnet_script_setup(r, pconf, sc))
 			return HANDLER_FINISHED;
 	}
 
@@ -3453,11 +3454,8 @@ magnet_attract (request_st * const r, plugin_data * const p, script * const sc)
 			log_error_multiline(r->conf.errh, __FILE__, __LINE__,
 			                    err, errlen, "lua: ");
 			/*lua_pop(L, 1);*/ /* pop error msg */ /* defer to later */
-			if (p->conf.stage >= 0) { /*(before response_start)*/
-				r->http_status = 500;
-				r->handler_module = NULL;
-				result = HANDLER_FINISHED;
-			}
+			if (pconf->stage >= 0) /*(before response_start)*/
+				result = http_status_set_err(r, 500); /* HANDLER_FINISHED */
 	}
 	else do {
 		/*(luaL_optinteger might raise error, which we want to avoid)*/
@@ -3481,22 +3479,21 @@ magnet_attract (request_st * const r, plugin_data * const p, script * const sc)
 		/*lua_pop(L, 1);*//* defer to later */
 
 		if (lua_return_value >= 200) {
-			r->http_status = lua_return_value;
 			/*(note: body may already have been set via lighty.r.resp_body.*)*/
 			if (lua_getfield_and_type(L, result_ndx, "content") == LUA_TTABLE) {
 				magnet_attach_content(L, r); /* deprecated legacy API */
 			}
 			/*lua_pop(L, 1);*//* defer to later */
 			if (!chunkqueue_is_empty(&r->write_queue)) {
-				r->handler_module = p->self;
+				r->handler_module = mod_magnet_plugin_data->self;
 			}
-			r->resp_body_finished = 1;
+			http_status_set_fin(r, lua_return_value);
 			result = HANDLER_FINISHED;
 		} else if (lua_return_value >= 100) {
 			/*(skip for response-start; send response as-is w/ added headers)*/
-			if (p->conf.stage < 0) break;
+			if (pconf->stage < 0) break;
 			/*(custom lua code should not return 101 Switching Protocols)*/
-			r->http_status = lua_return_value;
+			http_status_set(r, lua_return_value);
 			result = http_response_send_1xx(r)
 			  ? HANDLER_GO_ON
 			  : HANDLER_ERROR;
@@ -3513,6 +3510,8 @@ magnet_attract (request_st * const r, plugin_data * const p, script * const sc)
 				  http_header_env_set_ptr(r,CONST_STR_LEN("_L_MAGNET_RESTART"));
 				buffer_append_char(vb, '0');
 			}
+			buffer_reset(&r->physical.path);
+			r->handler_module = NULL;
 			result = HANDLER_COMEBACK;
 			if (++*vb->ptr-'0' >= 10) {
 				log_error(r->conf.errh, __FILE__, __LINE__,
@@ -3530,14 +3529,15 @@ magnet_attract (request_st * const r, plugin_data * const p, script * const sc)
 }
 
 static handler_t magnet_attract_array(request_st * const r, plugin_data * const p, int stage) {
-	mod_magnet_patch_config(r, p);
-	p->conf.stage = stage;
+	plugin_config pconf;
+	mod_magnet_patch_config(r, p, &pconf);
+	pconf.stage = stage;
 
 	script * const *scripts;
 	switch (stage) {
-	  case  1: scripts = p->conf.url_raw; break;
-	  case  0: scripts = p->conf.physical_path; break;
-	  case -1: scripts = p->conf.response_start; break;
+	  case  1: scripts = pconf.url_raw; break;
+	  case  0: scripts = pconf.physical_path; break;
+	  case -1: scripts = pconf.response_start; break;
 	  default: scripts = NULL; break;
 	}
 	if (NULL == scripts) return HANDLER_GO_ON; /* no scripts set */
@@ -3555,7 +3555,7 @@ static handler_t magnet_attract_array(request_st * const r, plugin_data * const 
 			req_env_inited = 1;
 			r->con->srv->request_env(r);
 		}
-		rc = magnet_attract(r, p, *scripts);
+		rc = magnet_attract(r, &pconf, *scripts);
 	} while (rc == HANDLER_GO_ON && *++scripts);
 
 	if (r->error_handler_saved_status) {
@@ -3594,7 +3594,7 @@ SUBREQUEST_FUNC(mod_magnet_handle_subrequest) {
             return HANDLER_WAIT_FOR_EVENT;
     }
 
-    buffer_clear(&r->physical.path);
+    buffer_reset(&r->physical.path);
     r->handler_module = NULL;
     return HANDLER_COMEBACK;
 }

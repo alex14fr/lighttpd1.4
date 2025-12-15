@@ -13,6 +13,7 @@ typedef gw_handler_ctx   handler_ctx;
 #include "base.h"
 #include "buffer.h"
 #include "http_cgi.h"
+#include "http_status.h"
 #include "log.h"
 
 enum { LI_PROTOCOL_SCGI, LI_PROTOCOL_UWSGI };
@@ -52,11 +53,11 @@ static void mod_scgi_merge_config(plugin_config * const pconf, const config_plug
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_scgi_patch_config(request_st * const r, plugin_data * const p) {
-    memcpy(&p->conf, &p->defaults, sizeof(plugin_config));
+static void mod_scgi_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_scgi_merge_config(&p->conf, p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_scgi_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -194,11 +195,9 @@ static handler_t scgi_create_env(handler_ctx *hctx) {
 	buffer_copy_string_len(b, CONST_STR_LEN("          "));
 
 	if (0 != http_cgi_headers(r, &opts, scgi_env_add, b)) {
-		r->http_status = 400;
-		r->handler_module = NULL;
 		buffer_clear(b);
 		chunkqueue_remove_finished_chunks(&hctx->wb);
-		return HANDLER_FINISHED;
+		return http_status_set_err(r, 400); /* Bad Request */
 	}
 
 	if (hctx->conf.proto == LI_PROTOCOL_SCGI) {
@@ -216,11 +215,9 @@ static handler_t scgi_create_env(handler_ctx *hctx) {
 		/* http://uwsgi-docs.readthedocs.io/en/latest/Protocol.html */
 		size_t len = buffer_clen(b)-10;
 		if (len > USHRT_MAX) {
-			r->http_status = 431; /* Request Header Fields Too Large */
-			r->handler_module = NULL;
 			buffer_clear(b);
 			chunkqueue_remove_finished_chunks(&hctx->wb);
-			return HANDLER_FINISHED;
+			return http_status_set_err(r, 431); /* Request Header Fields Too Large */
 		}
 		offset = 10 - 4;
 		b->ptr[offset]   = 0;
@@ -249,17 +246,16 @@ static handler_t scgi_create_env(handler_ctx *hctx) {
 
 
 static handler_t scgi_check_extension(request_st * const r, void *p_d, int uri_path_handler) {
-	plugin_data *p = p_d;
-	handler_t rc;
-
 	if (NULL != r->handler_module) return HANDLER_GO_ON;
 
-	mod_scgi_patch_config(r, p);
-	if (NULL == p->conf.exts) return HANDLER_GO_ON;
+	plugin_config pconf;
+	mod_scgi_patch_config(r, p_d, &pconf);
+	if (NULL == pconf.exts) return HANDLER_GO_ON;
 
-	rc = gw_check_extension(r, p, uri_path_handler, 0);
+	handler_t rc = gw_check_extension(r, &pconf, p_d, uri_path_handler, 0);
 	if (HANDLER_GO_ON != rc) return rc;
 
+	const plugin_data * const p = p_d;
 	if (r->handler_module == p->self) {
 		handler_ctx *hctx = r->plugin_ctx[p->id];
 		hctx->opts.backend = BACKEND_SCGI;

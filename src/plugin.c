@@ -341,10 +341,12 @@ static void plugins_call_fn_srv_data_all(server * const srv, const int e) {
         return plugins_call_fn_req_data(r, x); \
     }
 
+#if 0 /*(handled differently in http_response_prepare())*/
 PLUGIN_CALL_FN_REQ_DATA(PLUGIN_FUNC_HANDLE_URI_CLEAN, handle_uri_clean)
 PLUGIN_CALL_FN_REQ_DATA(PLUGIN_FUNC_HANDLE_DOCROOT, handle_docroot)
 PLUGIN_CALL_FN_REQ_DATA(PLUGIN_FUNC_HANDLE_PHYSICAL, handle_physical)
 PLUGIN_CALL_FN_REQ_DATA(PLUGIN_FUNC_HANDLE_SUBREQUEST_START, handle_subrequest_start)
+#endif
 PLUGIN_CALL_FN_REQ_DATA(PLUGIN_FUNC_HANDLE_RESPONSE_START, handle_response_start)
 PLUGIN_CALL_FN_REQ_DATA(PLUGIN_FUNC_HANDLE_REQUEST_DONE, handle_request_done)
 PLUGIN_CALL_FN_REQ_DATA(PLUGIN_FUNC_HANDLE_REQUEST_RESET, handle_request_reset)
@@ -511,10 +513,20 @@ handler_t plugins_call_init(server *srv) {
 			++offsets[PLUGIN_FUNC_WORKER_INIT];
 	}
 
+	/* allocate first space for response.c:http_response_config() */
+	++offsets[PLUGIN_FUNC_HANDLE_URI_CLEAN];
+
 	uint32_t nslots =
 	  (sizeof(offsets)+sizeof(plugin_fn_data)-1) / sizeof(plugin_fn_data);
 	for (uint32_t i = 0; i < PLUGIN_FUNC_SIZEOF; ++i) {
-		if (offsets[i]) {
+		/* note: allocate at least one slot for
+		 *   PLUGIN_FUNC_HANDLE_URI_CLEAN
+		 *   PLUGIN_FUNC_HANDLE_DOCROOT
+		 *   PLUGIN_FUNC_HANDLE_PHYSICAL
+		 *   PLUGIN_FUNC_HANDLE_SUBREQUEST_START
+		 * in order to be able to overwrite NULL w/ fn ptr in response.c
+		 */
+		if (offsets[i] || i <= PLUGIN_FUNC_HANDLE_SUBREQUEST_START) {
 			uint32_t offset = nslots;
 			nslots += offsets[i]+1; /* +1 to mark end of each list */
 			force_assert(offset * sizeof(plugin_fn_data) <= USHRT_MAX);
@@ -525,6 +537,10 @@ handler_t plugins_call_init(server *srv) {
 	/* allocate and fill slots of two dimensional array */
 	srv->plugin_slots = ck_calloc(nslots, sizeof(plugin_fn_data));
 	memcpy(srv->plugin_slots, offsets, sizeof(offsets));
+
+	/* allocate first space for response.c:http_response_config() */
+	plugins_call_init_slot(srv, (pl_cb_t)(uintptr_t)1, NULL,
+				offsets[PLUGIN_FUNC_HANDLE_URI_CLEAN]);
 
 	/* add handle_uri_raw before handle_uri_clean, but in same slot */
 	for (uint32_t i = 0; i < srv->plugins.used; ++i) {
