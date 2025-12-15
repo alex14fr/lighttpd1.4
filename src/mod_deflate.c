@@ -2051,7 +2051,7 @@ REQUEST_FUNC(mod_deflate_handle_response_start) {
 	if (NULL == vbro) return HANDLER_GO_ON;
 
 	/* Check for precompressed file */
-	if (p->conf.use_precomp
+	if (pconf.use_precomp
 		 && r->resp_body_finished
 	    && r->write_queue.first == r->write_queue.last
 	    && r->write_queue.first->type == FILE_CHUNK
