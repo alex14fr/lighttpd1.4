@@ -841,8 +841,8 @@ mod_openssl_session_ticket_key_file (const char *fn)
      *    4-byte - activation timestamp
      *    4-byte - expiration timestamp
      *   16-byte - session ticket key name
-     *   32-byte - session ticket HMAC encrpytion key
-     *   32-byte - session ticket AES encrpytion key
+     *   32-byte - session ticket HMAC encryption key
+     *   32-byte - session ticket AES encryption key
      *
      * STEK file can be created with a command such as:
      *   dd if=/dev/random bs=1 count=80 status=none | \
@@ -1673,7 +1673,7 @@ mod_openssl_patch_config (request_st * const r, plugin_config * const pconf)
 
 
 static int
-safer_X509_NAME_oneline(X509_NAME *name, char *buf, size_t sz)
+safer_X509_NAME_oneline(const X509_NAME *name, char *buf, size_t sz)
 {
     BIO *bio = BIO_new(BIO_s_mem());
     if (bio) {
@@ -1899,7 +1899,7 @@ app_verify_callback (X509_STORE_CTX *store_ctx, void *arg)
      * from ssl/ssl_x509.cc:ssl_crypto_x509_session_verify_cert_chain() to
      * X509_verify_cert(), but this intercepts and then turn around and call
      * X509_verify_cert().  This is an alternative to custom_verify_callback
-     * which repaces ssl/ssl_x509.cc:ssl_crypto_x509_session_verify_cert_chain()
+     * which replaces ssl/ssl_x509.cc:ssl_crypto_x509_session_verify_cert_chain
      * and results in custom_verify_callback having to replicate X509_STORE_CTX,
      * which is very complicated. */
     UNUSED(arg);
@@ -2595,6 +2595,7 @@ static int
 mod_openssl_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *ssl_ec_curve)
 {
   #ifndef OPENSSL_NO_ECDH
+   #if !defined(SSL_GROUP_X25519_MLKEM768)
     /* boringssl eccurves_default[] (now kDefaultGroups[])
      * has been the equivalent of "X25519:secp256r1:secp384r1" since 2016
      * (previously with secp521r1 appended for Android)
@@ -2602,10 +2603,14 @@ mod_openssl_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *
      *  since mid 2014) */
     if (NULL == ssl_ec_curve || buffer_is_blank(ssl_ec_curve))
         return 1;
+   #endif
 
     const char *groups = ssl_ec_curve && !buffer_is_blank(ssl_ec_curve)
       ? ssl_ec_curve->ptr
       :
+       #if defined(SSL_GROUP_X25519_MLKEM768)
+        "X25519MLKEM768:"
+       #endif
         /* boringssl include/openssl/evp.h contains comment:
          * > EVP_PKEY_X448 is defined for OpenSSL compatibility, but we do not
          * > support X448 and attempts to create keys will fail.
@@ -3823,7 +3828,7 @@ CONNECTION_FUNC(mod_openssl_handle_con_close)
 
 
 static void
-https_add_ssl_client_subject (request_st * const r, X509_NAME *xn)
+https_add_ssl_client_subject (request_st * const r, const X509_NAME * const xn)
 {
     const size_t prelen = sizeof("SSL_CLIENT_S_DN_")-1;
     char key[64] = "SSL_CLIENT_S_DN_";
@@ -3890,7 +3895,7 @@ https_add_ssl_client_entries (request_st * const r, handler_ctx * const hctx)
   #endif
     if (!xs) return;
 
-    X509_NAME * const xn = X509_get_subject_name(xs);
+    const X509_NAME * const xn = X509_get_subject_name(xs);
     {
         char buf[256];
         int len = safer_X509_NAME_oneline(xn, buf, sizeof(buf));

@@ -508,8 +508,8 @@ mod_openssl_session_ticket_key_file (const char *fn)
      *    4-byte - activation timestamp
      *    4-byte - expiration timestamp
      *   16-byte - session ticket key name
-     *   32-byte - session ticket HMAC encrpytion key
-     *   32-byte - session ticket AES encrpytion key
+     *   32-byte - session ticket HMAC encryption key
+     *   32-byte - session ticket AES encryption key
      *
      * STEK file can be created with a command such as:
      *   dd if=/dev/random bs=1 count=80 status=none | \
@@ -2336,6 +2336,15 @@ mod_openssl_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *
     const char *groups = ssl_ec_curve && !buffer_is_blank(ssl_ec_curve)
       ? ssl_ec_curve->ptr
       :
+       #if defined(HAVE_PQC) && !defined(WOLFSSL_NO_ML_KEM) /* wolfssl 5.8.4 */
+        /* defined(WOLFSSL_PQC_HYBRIDS) */
+        #ifdef HAVE_CURVE25519
+        "X25519MLKEM768:"
+        #endif
+        #ifdef HAVE_ECC
+        /*"SecP256r1MLKEM768:"*/
+        #endif
+       #endif
        #ifdef HAVE_CURVE25519
         "X25519"
        #endif
