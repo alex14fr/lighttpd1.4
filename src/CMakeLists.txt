@@ -470,10 +470,10 @@ endif()
 if(WITH_MBEDTLS)
 	check_include_files(mbedtls/ssl.h HAVE_MBEDTLS_SSL_H)
 	if(HAVE_MBEDTLS_SSL_H)
-		check_library_exists(tfpsacrypto mbedtls_base64_encode "" HAVE_LIBMBEDCRYPTO)
-		if(HAVE_LIBMBEDCRYPTO)
+		check_library_exists(tfpsacrypto mbedtls_base64_encode "" HAVE_LIBTFPSACRYPTO)
+		if(HAVE_LIBTFPSACRYPTO)
 			set(CRYPTO_LIBRARY tfpsacrypto)
-			set(HAVE_LIBTFPSACRYPTO 1)
+			set(HAVE_LIBMBEDCRYPTO 1)
 			check_library_exists(mbedtls mbedtls_ssl_init "" HAVE_LIBMBEDTLS)
 			if(HAVE_LIBMBEDTLS)
 			    check_library_exists(mbedx509 mbedtls_x509_get_name "" HAVE_LIBMBEDX509)
@@ -493,7 +493,7 @@ else()
 	unset(HAVE_MBEDTLS_SSL_H)
 	unset(HAVE_LIBMBEDCRYPTO)
 	unset(HAVE_LIBMBEDTLS)
-	unset(HAVE_LIBMEDX509)
+	unset(HAVE_LIBMBEDX509)
 endif()
 
 if(WITH_NSS)
@@ -548,13 +548,19 @@ if(WITH_GNUTLS)
 endif()
 
 if(WITH_PCRE2)
-	pkg_check_modules(PCRE2 libpcre2-8)
+	find_package(PCRE2 QUIET)
 	if(PCRE2_FOUND)
-		set(PCRE_LDFLAGS "${PCRE2_LDFLAGS}")
+		set(PCRE_LDFLAGS PCRE2::8BIT)
 		set(PCRE_CFLAGS "${PCRE2_CFLAGS}")
 	else()
-		## if we have pcre2-config, use it
-		xconfig(pcre2-config PCRE_LDFLAGS PCRE_CFLAGS)
+		pkg_check_modules(PCRE2 libpcre2-8)
+		if(PCRE2_FOUND)
+			set(PCRE_LDFLAGS "${PCRE2_LDFLAGS}")
+			set(PCRE_CFLAGS "${PCRE2_CFLAGS}")
+		else()
+			## if we have pcre2-config, use it
+			xconfig(pcre2-config PCRE_LDFLAGS PCRE_CFLAGS)
+		endif()
 	endif()
 	if(PCRE_LDFLAGS OR PCRE_CFLAGS)
 		message(STATUS "found pcre2 at: LDFLAGS: ${PCRE_LDFLAGS} CFLAGS: ${PCRE_CFLAGS}")
@@ -1014,6 +1020,7 @@ add_executable(test_common
 	t/test_base64.c
 	t/test_buffer.c
 	t/test_burl.c
+	t/test_http_cgi.c
 	t/test_http_header.c
 	t/test_http_kv.c
 	t/test_http_range.c
@@ -1222,7 +1229,7 @@ if(HAVE_GNUTLS)
 	target_link_libraries(mod_gnutls gnutls)
 endif()
 
-if(HAVE_LIBMBEDTLS AND HAVE_LIBMEDCRYPTO AND HAVE_LIBMEDX509)
+if(HAVE_LIBMBEDTLS AND HAVE_LIBMBEDCRYPTO AND HAVE_LIBMBEDX509)
 	add_and_install_library(mod_mbedtls "mod_mbedtls.c")
 	if(HAVE_LIBTFPSACRYPTO)
 		set(L_MOD_MBEDTLS ${L_MOD_MBEDTLS} mbedtls mbedx509 tfpsacrypto)

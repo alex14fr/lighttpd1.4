@@ -40,7 +40,7 @@ jobs:
             cmake meson ninja-build pkg-config scons \
             autoconf automake autotools-dev libtool m4 \
             nettle-dev gnutls-dev \
-            libmbedtls-dev libnss3-dev libssl-dev libwolfssl-dev \
+            libmbedtls-dev libnss3-dev libssl-dev \
             libpcre2-dev libbrotli-dev libdeflate-dev zlib1g-dev libzstd-dev \
             libsasl2-dev libkrb5-dev libdbi-dev libpam-dev libldap-dev \
             libmariadb-dev libpq-dev \
@@ -73,7 +73,7 @@ jobs:
             cmake meson ninja-build pkg-config scons \
             autoconf automake autotools-dev libtool m4 \
             nettle-dev gnutls-dev \
-            libmbedtls-dev libnss3-dev libssl-dev libwolfssl-dev \
+            libmbedtls-dev libnss3-dev libssl-dev \
             libpcre2-dev libbrotli-dev libdeflate-dev zlib1g-dev libzstd-dev \
             libsasl2-dev libkrb5-dev libdbi-dev libpam-dev libldap-dev \
             libmariadb-dev libpq-dev \
@@ -104,6 +104,7 @@ jobs:
       - name: Compile and Test
         run: |
           set -e
+          export WITH_WOLFSSL=1
           export NO_UNWIND=1
           cd "${{github.workspace}}" && scripts/ci-build.sh meson
 
@@ -135,8 +136,8 @@ jobs:
           prepare: |
             mount -t procfs proc /proc
           run: |
-            mkdir -p /usr/local/etc/pkg/repos
-            echo 'FreeBSD: { url: "pkg+https://pkg.FreeBSD.org/${ABI}/latest" }' > /usr/local/etc/pkg/repos/FreeBSD.conf
+            #mkdir -p /usr/local/etc/pkg/repos
+            #echo 'FreeBSD: { url: "pkg+https://pkg.FreeBSD.org/${ABI}/latest" }' > /usr/local/etc/pkg/repos/FreeBSD.conf
             pkg update -f -q
             pkg upgrade -y
             pkg install -y autoconf automake autotools libtool m4 pkgconf \
@@ -148,6 +149,7 @@ jobs:
               libmaxminddb libunwind lua51 lua54 \
               libxml2 sqlite3
             set -e
+            export WITH_WOLFSSL=1
             cd "${{github.workspace}}" && scripts/ci-build.sh meson
             cd "${{github.workspace}}" && scripts/ci-build.sh cmake
             cd "${{github.workspace}}" && scripts/ci-build.sh scons
@@ -161,21 +163,17 @@ jobs:
         with:
           #usesh: true
           prepare: |
-            pkg_add dash cmake ninja pkgconf pcre2 perl \
+            pkg_add -u dash cmake ninja pkgconf pcre2 perl \
               gnutls libressl mbedtls nettle nss wolfssl \
               cyrus-sasl mit-krb5 libdbi openldap-client \
               mariadb-client postgresql16-client \
               brotli libdeflate zlib zstd \
               libmaxminddb libunwind lua51 lua54 \
               libxml2 sqlite3
-            pkg_add dash
-          # note: repeat 'pkg_add dash' to exit 0
-          #   since NetBSD 10.0 has some issues with the packaging of the listed
-          #   packages above and exits non-zero due to various packaging issues,
-          #   but the result is still sufficient for lighttpd CI build tests.
           # autoconf automake gmake libtool m4 meson py311-scons
           run: |
             set -e
+            export WITH_WOLFSSL=1
             export NO_UNWIND=1
             cd "${{github.workspace}}" && scripts/ci-build.sh cmake
 
@@ -300,7 +298,7 @@ jobs:
           cd "${{github.workspace}}" && /bin/dash scripts/ci-build.sh autobuild
 
   Windows-VisualStudio:
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
     name: Windows-VisualStudio-${{matrix.platform}}
     strategy:
       matrix:
@@ -317,8 +315,8 @@ jobs:
       - name: Compile and Test
         run: |
           $ErrorActionPreference = 'Stop'
-          #cmake -G "Visual Studio 17 2022" -A "${{matrix.platform}}" -S "${{github.workspace}}" -B "build" -Wno-dev -DCMAKE_BUILD_TYPE=Release -DWITH_OPENSSL=ON -DWITH_PCRE2=OFF -DWITH_PCRE=OFF -DWITH_ZLIB=OFF
-          cmake -G "Visual Studio 17 2022" -A "${{matrix.platform}}" -S "${{github.workspace}}" -B "build" -Wno-dev -DCMAKE_BUILD_TYPE=Release -DWITH_PCRE2=OFF -DWITH_PCRE=OFF -DWITH_ZLIB=OFF
+          #cmake -G "Visual Studio 18 2026" -A "${{matrix.platform}}" -S "${{github.workspace}}" -B "build" -Wno-dev -DCMAKE_BUILD_TYPE=Release -DWITH_OPENSSL=ON -DWITH_PCRE2=OFF -DWITH_PCRE=OFF -DWITH_ZLIB=OFF
+          cmake -G "Visual Studio 18 2026" -A "${{matrix.platform}}" -S "${{github.workspace}}" -B "build" -Wno-dev -DCMAKE_BUILD_TYPE=Release -DWITH_PCRE2=OFF -DWITH_PCRE=OFF -DWITH_ZLIB=OFF
           cmake --build build --config Release
           # run the compiled unit tests src/t/test_*;
           # (skip the Perl test framework in tests/*)
@@ -377,11 +375,11 @@ jobs:
           packages: >
             build-base cmake meson ninja pkgconf perl scons
             autoconf automake libtool m4
-            gnutls-dev mbedtls-dev openssl-dev nettle-dev nss-dev wolfssl-dev
+            gnutls-dev mbedtls-dev openssl-dev nettle-dev nss-dev
             pcre2-dev brotli-dev libdeflate-dev zlib-dev zstd-dev
             cyrus-sasl-dev krb5-dev libdbi-dev linux-pam-dev openldap-dev
             mariadb-connector-c-dev postgresql16-dev
-            libmaxminddb-dev libunwind-dev lua5.1-dev lua5.4-dev
+            libmaxminddb-dev libunwind-dev lua5.1-dev lua5.5-dev
             libxml2-dev sqlite-dev
             zlib-static openssl-libs-static pcre2-static
       - name: Compile and Test

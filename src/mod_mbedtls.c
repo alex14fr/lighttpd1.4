@@ -1279,6 +1279,15 @@ mod_mbedtls_pk_parse_keyfile (mbedtls_pk_context *ctx, const char *fn, const cha
     if (dlen) ck_memzero(data, (size_t)dlen);
     free(data);
 
+  #if MBEDTLS_VERSION_NUMBER >= 0x04010000 /* mbedtls 4.1.0 */
+    /* https://github.com/Mbed-TLS/TF-PSA-Crypto/issues/807 */
+    if (0 == rc && ctx->MBEDTLS_PRIVATE(pub_raw_len) == 0)
+        rc = psa_export_public_key(ctx->MBEDTLS_PRIVATE(priv_id),
+                                   ctx->MBEDTLS_PRIVATE(pub_raw),
+                                   sizeof(ctx->MBEDTLS_PRIVATE(pub_raw)),
+                                   &ctx->MBEDTLS_PRIVATE(pub_raw_len));
+  #endif
+
     return rc;
 }
 
@@ -1477,8 +1486,7 @@ mod_mbedtls_alpn_selected (handler_ctx * const hctx, const char * const in)
       case 2:  /* "h2" */
         if (in[i] == 'h' && in[i+1] == '2') {
             proto = MOD_MBEDTLS_ALPN_H2;
-            if (hctx->r->handler_module == NULL)/*(e.g. not mod_sockproxy)*/
-                hctx->r->http_version = HTTP_VERSION_2;
+            hctx->r->http_version = HTTP_VERSION_2;
             break;
         }
         return 0;
@@ -1613,8 +1621,10 @@ static int
 mod_mbedtls_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *curvelist);
 
 
+#if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
 static int
 mod_mbedtls_ssl_conf_dhparameters(server *srv, plugin_config_socket *s, const buffer *dhparameters);
+#endif
 
 
 static void
@@ -1641,12 +1651,14 @@ mod_mbedtls_ssl_conf_cmd (server *srv, plugin_config_socket *s)
             if (!mod_mbedtls_ssl_conf_curves(srv, s, &ds->value))
                 rc = -1;
         }
+      #if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
         else if (buffer_eq_icase_slen(&ds->key, CONST_STR_LEN("DHParameters"))){
             if (!buffer_is_blank(&ds->value)) {
                 if (!mod_mbedtls_ssl_conf_dhparameters(srv, s, &ds->value))
                     rc = -1;
             }
         }
+      #endif
         else if (buffer_eq_icase_slen(&ds->key, CONST_STR_LEN("MaxProtocol")))
             mod_mbedtls_ssl_conf_proto(srv, s, &ds->value, 1); /* max */
         else if (buffer_eq_icase_slen(&ds->key, CONST_STR_LEN("MinProtocol")))
@@ -1839,7 +1851,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
                                       MBEDTLS_PSA_RANDOM_STATE,
                                       MBEDTLS_CIPHER_AES_256_GCM,
           #else
-                                      PSA_ALG_CATEGORY_AEAD,
+                                      PSA_ALG_GCM,
                                       PSA_KEY_TYPE_AES,
                                       256,
           #endif
@@ -2135,7 +2147,7 @@ SETDEFAULTS_FUNC(mod_mbedtls_set_defaults)
         T_CONFIG_STRING,
         T_CONFIG_SCOPE_CONNECTION }
      ,{ CONST_STR_LEN("debug.log-ssl-noise"),
-        T_CONFIG_BOOL,
+        T_CONFIG_SHORT,
         T_CONFIG_SCOPE_CONNECTION }
      ,{ CONST_STR_LEN("ssl.verifyclient.ca-file"),
         T_CONFIG_STRING,
@@ -3419,6 +3431,9 @@ static const int suite_ECJPAKE[] = {
 #endif
 
 #if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
+#if defined(MBEDTLS_KEY_EXCHANGE_RSA_ENABLED) \
+ || defined(MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED) \
+ || defined(MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED)
 static const int suite_AES_256[] = {
     /* All AES-256 suites */
   #ifdef MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
@@ -3442,8 +3457,12 @@ static const int suite_AES_256[] = {
   #endif
 };
 #endif
+#endif
 
 #if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
+#if defined(MBEDTLS_KEY_EXCHANGE_RSA_ENABLED) \
+ || defined(MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED) \
+ || defined(MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED)
 static const int suite_CAMELLIA_256[] = {
     /* All CAMELLIA-256 suites */
   #ifdef MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
@@ -3461,8 +3480,12 @@ static const int suite_CAMELLIA_256[] = {
   #endif
 };
 #endif
+#endif
 
 #if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
+#if defined(MBEDTLS_KEY_EXCHANGE_RSA_ENABLED) \
+ || defined(MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED) \
+ || defined(MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED)
 static const int suite_ARIA_256[] = {
     /* All ARIA-256 suites */
   #ifdef MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED
@@ -3485,8 +3508,12 @@ static const int suite_ARIA_256[] = {
   #endif
 };
 #endif
+#endif
 
 #if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
+#if defined(MBEDTLS_KEY_EXCHANGE_RSA_ENABLED) \
+ || defined(MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED) \
+ || defined(MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED)
 static const int suite_AES_128[] = {
     /* All AES-128 suites */
   #ifdef MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
@@ -3510,8 +3537,12 @@ static const int suite_AES_128[] = {
   #endif
 };
 #endif
+#endif
 
 #if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
+#if defined(MBEDTLS_KEY_EXCHANGE_RSA_ENABLED) \
+ || defined(MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED) \
+ || defined(MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED)
 static const int suite_CAMELLIA_128[] = {
     /* All CAMELLIA-128 suites */
   #ifdef MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
@@ -3529,8 +3560,12 @@ static const int suite_CAMELLIA_128[] = {
   #endif
 };
 #endif
+#endif
 
 #if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
+#if defined(MBEDTLS_KEY_EXCHANGE_RSA_ENABLED) \
+ || defined(MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED) \
+ || defined(MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED)
 static const int suite_ARIA_128[] = {
     /* All ARIA-128 suites */
   #ifdef MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED
@@ -3552,6 +3587,7 @@ static const int suite_ARIA_128[] = {
    ,MBEDTLS_TLS_RSA_WITH_ARIA_128_CBC_SHA256
   #endif
 };
+#endif
 #endif
 
 #ifdef MBEDTLS_KEY_EXCHANGE_RSA_PSK_ENABLED
@@ -4581,10 +4617,14 @@ mod_mbedtls_ssl_conf_ciphersuites (server *srv, plugin_config_socket *s, buffer 
                               /sizeof(*suite_AES_256_ephemeral)));
                 if (-1 == nids) return 0;
               #if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
+              #if defined(MBEDTLS_KEY_EXCHANGE_RSA_ENABLED) \
+               || defined(MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED) \
+               || defined(MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED)
                 nids = mod_mbedtls_ssl_append_ciphersuite(srv, ids, nids, idsz,
                          suite_AES_256,
                          (int)(sizeof(suite_AES_256)/sizeof(*suite_AES_256)));
                 if (-1 == nids) return 0;
+              #endif
               #endif
                 /* XXX: not done: AES256 PSK suites */
                 if (nlen == sizeof("AES256")-1) continue;
@@ -4598,10 +4638,14 @@ mod_mbedtls_ssl_conf_ciphersuites (server *srv, plugin_config_socket *s, buffer 
                               /sizeof(*suite_AES_128_ephemeral)));
                 if (-1 == nids) return 0;
               #if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
+              #if defined(MBEDTLS_KEY_EXCHANGE_RSA_ENABLED) \
+               || defined(MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED) \
+               || defined(MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED)
                 nids = mod_mbedtls_ssl_append_ciphersuite(srv, ids, nids, idsz,
                          suite_AES_128,
                          (int)(sizeof(suite_AES_128)/sizeof(*suite_AES_128)));
                 if (-1 == nids) return 0;
+              #endif
               #endif
                 /* XXX: not done: AES128 PSK suites */
                 continue;
@@ -4615,11 +4659,15 @@ mod_mbedtls_ssl_conf_ciphersuites (server *srv, plugin_config_socket *s, buffer 
                               /sizeof(*suite_CAMELLIA_256_ephemeral)));
                 if (-1 == nids) return 0;
               #if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
+              #if defined(MBEDTLS_KEY_EXCHANGE_RSA_ENABLED) \
+               || defined(MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED) \
+               || defined(MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED)
                 nids = mod_mbedtls_ssl_append_ciphersuite(srv, ids, nids, idsz,
                          suite_CAMELLIA_256,
                          (int)(sizeof(suite_CAMELLIA_256)
                               /sizeof(*suite_CAMELLIA_256)));
                 if (-1 == nids) return 0;
+              #endif
               #endif
                 /* XXX: not done: CAMELLIA256 PSK suites */
                 if (nlen == sizeof("CAMELLIA256")-1) continue;
@@ -4633,11 +4681,15 @@ mod_mbedtls_ssl_conf_ciphersuites (server *srv, plugin_config_socket *s, buffer 
                               /sizeof(*suite_CAMELLIA_128_ephemeral)));
                 if (-1 == nids) return 0;
               #if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
+              #if defined(MBEDTLS_KEY_EXCHANGE_RSA_ENABLED) \
+               || defined(MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED) \
+               || defined(MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED)
                 nids = mod_mbedtls_ssl_append_ciphersuite(srv, ids, nids, idsz,
                          suite_CAMELLIA_128,
                          (int)(sizeof(suite_CAMELLIA_128)
                               /sizeof(*suite_CAMELLIA_128)));
                 if (-1 == nids) return 0;
+              #endif
               #endif
                 /* XXX: not done: CAMELLIA128 PSK suites */
                 continue;
@@ -4651,10 +4703,14 @@ mod_mbedtls_ssl_conf_ciphersuites (server *srv, plugin_config_socket *s, buffer 
                               /sizeof(*suite_ARIA_256_ephemeral)));
                 if (-1 == nids) return 0;
               #if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
+              #if defined(MBEDTLS_KEY_EXCHANGE_RSA_ENABLED) \
+               || defined(MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED) \
+               || defined(MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED)
                 nids = mod_mbedtls_ssl_append_ciphersuite(srv, ids, nids, idsz,
                          suite_ARIA_256,
                          (int)(sizeof(suite_ARIA_256)/sizeof(*suite_ARIA_256)));
                 if (-1 == nids) return 0;
+              #endif
               #endif
                 /* XXX: not done: ARIA256 PSK suites */
                 if (nlen == sizeof("ARIA256")-1) continue;
@@ -4668,10 +4724,14 @@ mod_mbedtls_ssl_conf_ciphersuites (server *srv, plugin_config_socket *s, buffer 
                               /sizeof(*suite_ARIA_128_ephemeral)));
                 if (-1 == nids) return 0;
               #if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
+              #if defined(MBEDTLS_KEY_EXCHANGE_RSA_ENABLED) \
+               || defined(MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED) \
+               || defined(MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED)
                 nids = mod_mbedtls_ssl_append_ciphersuite(srv, ids, nids, idsz,
                          suite_ARIA_128,
                          (int)(sizeof(suite_ARIA_128)/sizeof(*suite_ARIA_128)));
                 if (-1 == nids) return 0;
+              #endif
               #endif
                 /* XXX: not done: ARIA128 PSK suites */
                 continue;
@@ -4978,6 +5038,7 @@ mod_mbedtls_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *
 #endif /* MBEDTLS_VERSION_NUMBER >= 0x03010000 */ /* mbedtls 3.01.0 */
 
 
+#if MBEDTLS_VERSION_NUMBER < 0x04000000 /* mbedtls 4.0.0 */
 static int
 mod_mbedtls_ssl_conf_dhparameters(server *srv, plugin_config_socket *s, const buffer *dhparameters)
 {
@@ -5003,6 +5064,7 @@ mod_mbedtls_ssl_conf_dhparameters(server *srv, plugin_config_socket *s, const bu
     return 1;
   #endif
 }
+#endif
 
 
 #if MBEDTLS_VERSION_NUMBER < 0x03020000 /* mbedtls 3.02.0 */

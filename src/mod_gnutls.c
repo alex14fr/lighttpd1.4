@@ -1614,8 +1614,6 @@ network_gnutls_load_pemfile (server *srv, const buffer *pemfile, const buffer *p
         int rc = mod_gnutls_construct_crt_chain(kp, d, srv->errh);
         if (rc < 0) {
             mod_gnutls_kp_free(kp);
-            mod_gnutls_free_config_crts(d);
-            gnutls_privkey_deinit(pkey);
             free(pc);
             return NULL;
         }
@@ -1729,8 +1727,6 @@ mod_gnutls_acme_tls_1 (handler_ctx *hctx)
     rc = mod_gnutls_construct_crt_chain(kp, d, errh);
     if (rc < 0) {
         mod_gnutls_kp_free(kp);
-        mod_gnutls_free_config_crts(d);
-        gnutls_privkey_deinit(pkey);
         return rc;
     }
 
@@ -1802,8 +1798,7 @@ mod_gnutls_ALPN (handler_ctx * const hctx, const unsigned char * const in, const
             if (in[i] == 'h' && in[i+1] == '2') {
                 if (!hctx->r->conf.h2proto) continue;
                 hctx->alpn = MOD_GNUTLS_ALPN_H2;
-                if (hctx->r->handler_module == NULL)/*(e.g. not mod_sockproxy)*/
-                    hctx->r->http_version = HTTP_VERSION_2;
+                hctx->r->http_version = HTTP_VERSION_2;
                 return GNUTLS_E_SUCCESS;
             }
             continue;
@@ -2506,7 +2501,7 @@ SETDEFAULTS_FUNC(mod_gnutls_set_defaults)
         T_CONFIG_STRING,
         T_CONFIG_SCOPE_CONNECTION }
      ,{ CONST_STR_LEN("debug.log-ssl-noise"),
-        T_CONFIG_BOOL,
+        T_CONFIG_SHORT,
         T_CONFIG_SCOPE_CONNECTION }
      ,{ CONST_STR_LEN("ssl.verifyclient.ca-file"),
         T_CONFIG_STRING,
@@ -3933,6 +3928,14 @@ mod_gnutls_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *c
       "X25519MLKEM768",     "GROUP-X25519-MLKEM768"
     };
 
+    /* runtime test for gnutls library support for PQC hybrid groups */
+    gnutls_priority_t priority_cache;
+    const char *err_pos;
+    int rc = gnutls_priority_init(&priority_cache,
+                                  "SECURE:+GROUP-X25519-MLKEM768", &err_pos);
+    gnutls_priority_deinit(priority_cache);
+    const int mlkem = (0 == rc);
+
     buffer * const plist = &s->priority_str;
     const char *groups = curvelist && !buffer_is_blank(curvelist)
       ? curvelist->ptr
@@ -3954,6 +3957,13 @@ mod_gnutls_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *c
         if (i == sizeof(names)/sizeof(*names)) {
             log_error(srv->errh, __FILE__, __LINE__,
                       "GnuTLS: unrecognized curve: %.*s; ignored", (int)len, n);
+            continue;
+        }
+
+        /* check gnutls library support for PQC hybrid groups */
+        if (!mlkem && strstr(names[i], "MLKEM") != NULL && curvelist) {
+            log_error(srv->errh, __FILE__, __LINE__,
+                      "GnuTLS: unsupported group: %.*s; ignored", (int)len, n);
             continue;
         }
 

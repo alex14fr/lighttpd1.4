@@ -687,7 +687,7 @@ void http_response_backend_error (request_st * const r) {
 		/*(unset handler to avoid later call to http_response_backend_done())*/
 		r->handler_module = NULL;  /*(avoid sending final chunked block)*/
 		r->keep_alive = 0;
-		r->resp_body_finished = 1;
+		r->resp_body_finished = 2; /* truncated; 2 is flag for h2.c */
 	} /*(else error status set later by http_response_backend_done())*/
 }
 
@@ -721,14 +721,11 @@ void http_response_backend_done (request_st * const r) {
 			 * there would be no Content-Length and lighttpd would have sent
 			 * Connection: close.  Alternatively, since not streaming (if these
 			 * conditions are true), could send an HTTP status error instead of
-			 * sending partial content with a bogus Content-Length.  If we do
-			 * not send an HTTP error status, then response_start hooks may add
-			 * caching headers (e.g. mod_expire, mod_setenv).  If in future we
-			 * send HTTP error status, might special-case HEAD requests and
-			 * clear response body so that response headers (w/o Content-Length)
-			 * can be sent.  For now, we have chosen to send partial content,
-			 * including generating an incorrect Content-Length (later), and not
-			 * to take any of these extra steps. */
+			 * sending partial content w/o Content-Length and w/ Connection: close.
+			 * If we do not send an HTTP error status, then response_start hooks
+			 * may add caching headers (e.g. mod_expire, mod_setenv).  For now,
+			 * we have chosen to send partial content, omit Content-Length, send
+			 * Connection: close, and not to take any of these extra steps. */
 			else if (__builtin_expect( (r->http_version == HTTP_VERSION_1_0), 0)
 			         && r->gw_dechunk && !r->gw_dechunk->done
 			         && !(r->conf.stream_response_body
@@ -749,6 +746,10 @@ void http_response_backend_done (request_st * const r) {
 			}
 		  #endif
 			r->resp_body_finished = 1;
+			if (r->gw_dechunk && !r->gw_dechunk->done) {
+				r->resp_body_finished = 2; /* truncated; 2 is flag for h2.c */
+				r->keep_alive = 0; /*(0 does not affect h2)*/
+			}
 		}
 	default:
 		break;
@@ -1076,10 +1077,8 @@ static int http_response_process_headers(request_st * const restrict r, http_res
                 r->resp_body_scratchpad =
                   (off_t)li_restricted_strtoint64(value, vlen, &err);
                 if (err != value + vlen) {
-                    /*(invalid Content-Length value from backend;
-                     * read from backend until backend close, hope for the best)
-                     *(might choose to treat this as 502 Bad Gateway) */
-                    r->resp_body_scratchpad = -1;
+                    http_status_set_err(r, 502); /* Bad Gateway */
+                    continue;
                 }
             }
             else {
